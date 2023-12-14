@@ -14,6 +14,8 @@
 #include <rte_pci.h>
 #include <rte_version.h>
 
+#define DPG_USE_HARDWARE_COUNTERS
+
 #define DPG_ICMP_SEQ_NB_START 1
 #define DPG_ICMP_SEQ_NB_END 50000
 
@@ -39,6 +41,10 @@
 #define DPG_ETH_RSS_TCP RTE_ETH_RSS_TCP
 #define DPG_ETH_RSS_UDP RTE_ETH_RSS_UDP
 #endif
+
+struct dpg_counter {
+	uint64_t per_lcore[RTE_MAX_LCORE];
+};
 
 struct dpg_ether_hdr {
 	struct rte_ether_addr dst_addr;
@@ -125,6 +131,8 @@ static uint64_t g_hz;
 static struct dpg_port g_ports[RTE_MAX_ETHPORTS];
 static struct dpg_lcore g_lcores[RTE_MAX_LCORE];
 static struct rte_mempool *g_pktmbuf_pool;
+struct dpg_counter g_ipackets;
+struct dpg_counter g_opackets;
 static struct rte_eth_conf g_port_conf = {
 	.rxmode = {
 		.split_hdr_size = 0,
@@ -146,6 +154,31 @@ static struct rte_eth_conf g_port_conf = {
 
 #define dpg_die(...) \
 	rte_exit(EXIT_FAILURE, ##__VA_ARGS__);
+
+#ifdef DPG_USE_HARDWARE_COUNTERS
+#define dpg_counter_add(c, add)
+#define dpg_counter_get(c) 0
+#else
+static void
+dpg_counter_add(struct dpg_counter *c, uint64_t add)
+{
+	c->per_lcore[rte_lcore_id()] += add;
+}
+
+static uint64_t
+dpg_counter_get(struct dpg_counter *c)
+{
+	int i;
+	uint64_t sum;
+
+	sum = 0;
+	for (i = 0; i < DPG_ARRAY_SIZE(c->per_lcore); ++i) {
+		sum += c->per_lcore[i];
+	}
+
+	return sum;
+}
+#endif
 
 static void
 dpg_invalid_argument(int arg)
@@ -530,6 +563,9 @@ dpg_do_job(struct dpg_job *job)
 
 	n_tx = 0;
 	n_rx = rte_eth_rx_burst(job->port_id, job->queue_id, rx_pkts, DPG_ARRAY_SIZE(rx_pkts));
+
+	dpg_counter_add(&g_ipackets, n_rx);
+
 	for (i = 0; i < n_rx; ++i) {
 		m = rx_pkts[i];
 		if (job->echo == 0) {
@@ -586,10 +622,16 @@ drop:
 	}
 
 	txed = 0;
-	while (txed < n_tx) {
+//	while (txed < n_tx) {
 		txed += rte_eth_tx_burst(job->port_id, job->queue_id,
 				tx_pkts + txed, n_tx - txed);
+//	}
+
+	for (i = txed; i < n_tx; ++i) {
+		rte_pktmbuf_free(tx_pkts[i]);
 	}
+
+	dpg_counter_add(&g_opackets, txed);
 }
 
 static void
@@ -598,6 +640,7 @@ dpg_set_microseconds(void)
 	g_microseconds = 1000000 * rte_rdtsc() / g_hz;
 }
 
+#ifdef DPG_USE_HARDWARE_COUNTERS
 static void
 dpg_get_stats(uint64_t *ipackets, uint64_t *opackets)
 {
@@ -606,6 +649,7 @@ dpg_get_stats(uint64_t *ipackets, uint64_t *opackets)
 
 	*ipackets = 0;
 	*opackets = 0;
+
 	for (i = 0; i < DPG_ARRAY_SIZE(g_ports); ++i) {
 		if (!dpg_port_is_configured(g_ports + i)) {
 			continue;
@@ -617,6 +661,14 @@ dpg_get_stats(uint64_t *ipackets, uint64_t *opackets)
 		*opackets += stats.opackets;
 	}
 }
+#else // DPG_USE_HARDWARE_COUNTERS
+static void
+dpg_get_stats(uint64_t *ipackets, uint64_t *opackets)
+{
+	*ipackets = dpg_counter_get(&g_ipackets);
+	*opackets = dpg_counter_get(&g_opackets);
+}
+#endif // DPG_USE_HARDWARE_COUNTERS
 
 static int
 lcore_loop(void *dummy)
@@ -626,6 +678,7 @@ lcore_loop(void *dummy)
 	uint64_t last_stats_time;
 	uint64_t ipackets[2], opackets[2];
 	uint64_t ipps, opps;
+	double dt;
 	struct dpg_lcore *lcore;
 	struct dpg_job *job;
 
@@ -644,8 +697,9 @@ lcore_loop(void *dummy)
 		p = 0;
 		dpg_get_stats(&ipackets[p], &opackets[p]);
 		p = 1 - p;
-		last_stats_time = g_microseconds;
 	}
+
+	last_stats_time = g_microseconds;
 
 	for (;;) {
 		if (lcore->is_first) {
@@ -657,10 +711,11 @@ lcore_loop(void *dummy)
 		}
 
 		if (lcore->is_first && g_microseconds - last_stats_time >= 1000000) {
+			dt = g_microseconds - last_stats_time;
 			last_stats_time = g_microseconds;
 			dpg_get_stats(&ipackets[p], &opackets[p]);
-			ipps = ipackets[p] - ipackets[1 - p];
-			opps = opackets[p] - opackets[1 - p];
+			ipps = (ipackets[p] - ipackets[1 - p]) / dt * 1000000;
+			opps = (opackets[p] - opackets[1 - p]) / dt * 1000000;
 			p = 1 - p;
 
 			if (reports == 20) {
@@ -766,6 +821,7 @@ main(int argc, char **argv)
 		n_mbufs += n_txq * (port->n_txd + DPG_MAX_PKT_BURST);
 	}
 
+	n_mbufs *= 2;
 	n_mbufs = DPG_MAX(n_mbufs, 8192);
 
 	g_pktmbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", n_mbufs,
