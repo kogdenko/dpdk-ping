@@ -1,18 +1,82 @@
+// SPDX-License-Identifier: GPL-2.0-only
+
+#include <arpa/inet.h>
 #include <getopt.h>
+#include <netinet/in.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 
 #include <rte_bus.h>
+#include <rte_common.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
-#include <rte_common.h>
 #include <rte_mbuf.h>
 #include <rte_pci.h>
+#include <rte_version.h>
 
 #define DPG_ICMP_SEQ_NB_START 1
 #define DPG_ICMP_SEQ_NB_END 50000
 
 #define DPG_MEMPOOL_CACHE_SIZE 128
 #define DPG_MAX_PKT_BURST 256
+
+#if RTE_VERSION < RTE_VERSION_NUM(20, 11, 0, 99)
+#error "Unsupported DPDK version"
+#endif
+
+#if RTE_VER_YEAR < 21 // TODO: Findout exact version when changes took place
+#define DPG_ETH_MQ_TX_NONE ETH_MQ_TX_NONE
+#define DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE DEV_TX_OFFLOAD_MBUF_FAST_FREE
+#define DPG_ETH_MQ_RX_RSS ETH_MQ_RX_RSS
+#define DPG_ETH_RSS_IP ETH_RSS_IP
+#define DPG_ETH_RSS_TCP ETH_RSS_TCP
+#define DPG_ETH_RSS_UDP ETH_RSS_UDP
+#else
+#define DPG_ETH_MQ_TX_NONE RTE_ETH_MQ_TX_NONE
+#define DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE
+#define DPG_ETH_MQ_RX_RSS RTE_ETH_MQ_RX_RSS
+#define DPG_ETH_RSS_IP RTE_ETH_RSS_IP
+#define DPG_ETH_RSS_TCP RTE_ETH_RSS_TCP
+#define DPG_ETH_RSS_UDP RTE_ETH_RSS_UDP
+#endif
+
+struct dpg_ether_hdr {
+	struct rte_ether_addr dst_addr;
+	struct rte_ether_addr src_addr;
+	uint16_t ether_type;
+}  __attribute__((aligned (2)));
+
+struct dpg_ipv4_hdr {
+        union {
+		uint8_t version_ihl;
+		struct {
+#if RTE_BYTE_ORDER == RTE_LITTLE_ENDIAN
+			uint8_t ihl:4;
+			uint8_t version:4;
+#elif RTE_BYTE_ORDER == RTE_BIG_ENDIAN
+			uint8_t version:4;
+			uint8_t ihl:4;
+#endif
+		};
+	};
+	uint8_t  type_of_service;
+	rte_be16_t total_length;
+	rte_be16_t packet_id;
+	rte_be16_t fragment_offset;
+	uint8_t time_to_live;
+	uint8_t next_proto_id;
+	rte_be16_t hdr_checksum;
+	rte_be32_t src_addr;
+	rte_be32_t dst_addr;
+} __attribute__((packed));
+
+struct dpg_icmp_hdr {
+	uint8_t  icmp_type;
+	uint8_t  icmp_code;
+	rte_be16_t icmp_cksum;
+	rte_be16_t icmp_ident;
+	rte_be16_t icmp_seq_nb;
+} __attribute__((packed));
 
 struct dpg_job {
 	struct dpg_job *lcore_next;
@@ -66,7 +130,7 @@ static struct rte_eth_conf g_port_conf = {
 		.split_hdr_size = 0,
 	},
 	.txmode = {
-		.mq_mode = RTE_ETH_MQ_TX_NONE,
+		.mq_mode = DPG_ETH_MQ_TX_NONE,
 	},
 };
 
@@ -125,6 +189,76 @@ dpg_strzcpy(char *dest, const char *src, size_t n)
 	dest[i] = '\0';
 	return dest;
 }*/
+
+static inline uint64_t
+dpg_cksum_add(uint64_t sum, uint64_t x)
+{
+	sum += x;
+	if (sum < x) {
+		++sum;
+	}
+	return sum;
+}
+
+static uint16_t
+dpg_cksum_reduce(uint64_t sum)
+{
+	uint64_t mask;
+	uint16_t reduced;
+
+	mask = 0xffffffff00000000lu;
+	while (sum & mask) {
+		sum = dpg_cksum_add(sum & ~mask, (sum >> 32) & ~mask);
+	}
+	mask = 0xffffffffffff0000lu;
+	while (sum & mask) {
+		sum = dpg_cksum_add(sum & ~mask, (sum >> 16) & ~mask);
+	}
+	reduced = ~((uint16_t)sum);
+	if (reduced == 0) {
+		reduced = 0xffff;
+	}
+	return reduced;
+}
+
+static uint64_t
+dpg_cksum_raw(const u_char *b, int size)
+{
+	uint64_t sum;
+
+	sum = 0;
+	while (size >= sizeof(uint64_t)) {
+		sum = dpg_cksum_add(sum, *((uint64_t *)b));
+		size -= sizeof(uint64_t);
+		b += sizeof(uint64_t);
+	}
+	if (size >= 4) {
+		sum = dpg_cksum_add(sum, *((uint32_t *)b));
+		size -= sizeof(uint32_t);
+		b += sizeof(uint32_t);
+	}
+	if (size >= 2) {
+		sum = dpg_cksum_add(sum, *((uint16_t *)b));
+		size -= sizeof(uint16_t);
+		b += sizeof(uint16_t);
+	}
+	if (size) {
+		assert(size == 1);
+		sum = dpg_cksum_add(sum, *b);
+	}
+	return sum;
+}
+
+uint16_t
+dpg_cksum(void *data, int len)
+{
+	uint64_t sum;
+	uint16_t reduced;
+
+	sum = dpg_cksum_raw(data, len);
+	reduced = dpg_cksum_reduce(sum);
+	return reduced;
+}
 
 static void
 dpg_norm2(char *buf, double val, char *fmt, int normalize)
@@ -320,9 +454,9 @@ static struct rte_mbuf *
 dpg_create_icmp_request(struct dpg_job *job)
 {
 	struct rte_mbuf *m;
-	struct rte_ether_hdr *eh;
-	struct rte_ipv4_hdr *ih;
-	struct rte_icmp_hdr *ich;
+	struct dpg_ether_hdr *eh;
+	struct dpg_ipv4_hdr *ih;
+	struct dpg_icmp_hdr *ich;
 	struct dpg_port *port;
 
 	port = g_ports + job->port_id;
@@ -336,9 +470,9 @@ dpg_create_icmp_request(struct dpg_job *job)
 	m->data_len = sizeof(*eh) + sizeof(*ih) + sizeof(*ich);
 	m->pkt_len = m->data_len;
 
-	eh = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
-	ih = (struct rte_ipv4_hdr *)(eh + 1);
-	ich = (struct rte_icmp_hdr *)(ih + 1);
+	eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
+	ih = (struct dpg_ipv4_hdr *)(eh + 1);
+	ich = (struct dpg_icmp_hdr *)(ih + 1);
 
 	eh->ether_type = RTE_BE16(RTE_ETHER_TYPE_IPV4);
 	rte_ether_addr_copy(&job->dst_eth_addr, &eh->dst_addr);
@@ -362,8 +496,8 @@ dpg_create_icmp_request(struct dpg_job *job)
 	ich->icmp_ident = RTE_BE16(1);
 	ich->icmp_seq_nb = rte_cpu_to_be_16(job->icmp_seq_nb);
 
-	ich->icmp_cksum = rte_raw_cksum(&ich, sizeof(ich));
-	ih->hdr_checksum = rte_ipv4_cksum(ih);
+	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
+	ich->icmp_cksum = dpg_cksum(ich, sizeof(*ich));
 
 	if (job->icmp_seq_nb < DPG_ICMP_SEQ_NB_END) {
 		job->icmp_seq_nb++;
@@ -389,9 +523,9 @@ dpg_do_job(struct dpg_job *job)
 {
 	int i, n_rx, n_tx, n_reqs, tx_burst, txed;
 	uint64_t now, dt;
-	struct rte_ether_hdr *eh;
-	struct rte_ipv4_hdr *ih;
-	struct rte_icmp_hdr *ich;
+	struct dpg_ether_hdr *eh;
+	struct dpg_ipv4_hdr *ih;
+	struct dpg_icmp_hdr *ich;
 	struct rte_mbuf *m, *rx_pkts[DPG_MAX_PKT_BURST], *tx_pkts[DPG_MAX_PKT_BURST];
 
 	n_tx = 0;
@@ -401,17 +535,17 @@ dpg_do_job(struct dpg_job *job)
 		if (job->echo == 0) {
 			goto drop;
 		}
-		eh = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+		eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
 		if (eh->ether_type != RTE_BE16(RTE_ETHER_TYPE_IPV4)) {
 			goto drop;
 		} 
 
-		ih = (struct rte_ipv4_hdr *)(eh + 1);
+		ih = (struct dpg_ipv4_hdr *)(eh + 1);
 		if (ih->next_proto_id != IPPROTO_ICMP) {
 			goto drop;
 		}
 
-		ich = (struct rte_icmp_hdr *)(ih + 1);
+		ich = (struct dpg_icmp_hdr *)(ih + 1);
 		if (ich->icmp_type != RTE_IP_ICMP_ECHO_REQUEST) {
 			goto drop;
 		}
@@ -421,9 +555,9 @@ dpg_do_job(struct dpg_job *job)
 		DPG_SWAP(eh->src_addr, eh->dst_addr);
 
 		ich->icmp_cksum = 0;
-		ich->icmp_cksum = rte_raw_cksum(&ich, sizeof(ich));
+		ich->icmp_cksum = dpg_cksum(ich, sizeof(*ich));
 		ih->hdr_checksum = 0;
-		ih->hdr_checksum = rte_ipv4_cksum(ih);
+		ih->hdr_checksum = dpg_cksum(ih, ih->ihl * sizeof(uint32_t));
 
 		tx_pkts[n_tx++] = m;
 		continue;
@@ -596,13 +730,13 @@ main(int argc, char **argv)
 		port_name = dpg_port_name(port, &dev_info);
 
 		port->conf = g_port_conf;
-		if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
-			port->conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+		if (dev_info.tx_offload_capa & DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
+			port->conf.txmode.offloads |= DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 		}
 		if (port->n_queues > 1) {
-			port->conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+			port->conf.rxmode.mq_mode = DPG_ETH_MQ_RX_RSS;
 			port->conf.rx_adv_conf.rss_conf.rss_hf =
-					RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP;
+					DPG_ETH_RSS_IP | DPG_ETH_RSS_TCP | DPG_ETH_RSS_UDP;
 			port->conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
 		}
 
