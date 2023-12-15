@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <getopt.h>
 #include <netinet/in.h>
 #include <stdlib.h>
@@ -20,13 +21,23 @@
 #define DPG_ICMP_SEQ_NB_END 50000
 
 #define DPG_MEMPOOL_CACHE_SIZE 128
-#define DPG_MAX_PKT_BURST 256
+#define DPG_MAX_PKT_BURST 128
 
-#if RTE_VERSION < RTE_VERSION_NUM(20, 11, 0, 99)
-#error "Unsupported DPDK version"
+#define DPG_PPSTR(x) DPG_PPXSTR(x)
+#define DPG_PPXSTR(x) #x
+
+#pragma message "DPDK: "\
+		DPG_PPSTR(RTE_VER_YEAR)"." \
+		DPG_PPSTR(RTE_VER_MONTH)"." \
+		DPG_PPSTR(RTE_VER_MINOR)"." \
+		DPG_PPSTR(RTE_VER_RELEASE)
+
+#if RTE_VERSION < RTE_VERSION_NUM(19, 11, 14, 99)
+#error "Not tested DPDK version"
 #endif
 
-#if RTE_VER_YEAR < 21 // TODO: Findout exact version when changes took place
+// TODO: Findout exact version when changes took place
+#if RTE_VERSION <= RTE_VERSION_NUM(20, 11, 0, 99) 
 #define DPG_ETH_MQ_TX_NONE ETH_MQ_TX_NONE
 #define DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE DEV_TX_OFFLOAD_MBUF_FAST_FREE
 #define DPG_ETH_MQ_RX_RSS ETH_MQ_RX_RSS
@@ -110,6 +121,11 @@ struct dpg_job {
 	uint32_t dst_ip_current;
 	uint32_t dst_ip_start;
 	uint32_t dst_ip_end;
+
+	uint16_t icmp_id_current;
+	uint16_t icmp_id_start;
+	uint16_t icmp_id_end;
+
 };
 
 struct dpg_port {
@@ -134,9 +150,6 @@ static struct rte_mempool *g_pktmbuf_pool;
 struct dpg_counter g_ipackets;
 struct dpg_counter g_opackets;
 static struct rte_eth_conf g_port_conf = {
-	.rxmode = {
-		.split_hdr_size = 0,
-	},
 	.txmode = {
 		.mq_mode = DPG_ETH_MQ_TX_NONE,
 	},
@@ -154,6 +167,13 @@ static struct rte_eth_conf g_port_conf = {
 
 #define dpg_die(...) \
 	rte_exit(EXIT_FAILURE, ##__VA_ARGS__);
+
+// TODO: Findout exact version when changes took place
+#if RTE_VERSION < RTE_VERSION_NUM(23, 11, 0, 99) 
+#define dpg_dev_name(dev) ((dev)->name)
+#else
+#define dpg_dev_name(dev) rte_dev_name(dev)
+#endif
 
 #ifdef DPG_USE_HARDWARE_COUNTERS
 #define dpg_counter_add(c, add)
@@ -200,9 +220,10 @@ dpg_print_usage()
 	"\t-R:  Send ICMP echo requests\n"
 	"\t-E:  Send ICMP echo reply on incoming ICMP echo requests\n"
 	"\t-B {packets per second}:  ICMP requests bandwidth\n"
-	"\t-D {ether address}:  Destination etherne address\n"
+	"\t-A {ether address}:  Destination ethernet address\n"
 	"\t-s {ip[-ip]}:  Source ip addresses interval\n"
 	"\t-d {ip[-ip]}:  Destination ip addresses interval\n"
+	"\t-i {icmp id[-icmp id]}:  ICMP request id interval\n"
 	"\n"
 	);
 }
@@ -329,12 +350,12 @@ static int
 dpg_parse_ip_interval(char *str, uint32_t *ip_start, uint32_t *ip_end)
 {
 	int rc;
-	char *ptr;
+	char *delim;
 	struct in_addr addr;
 
-	ptr = strchr(str, '-');
-	if (ptr != NULL) {
-		*ptr = '\0';
+	delim = strchr(str, '-');
+	if (delim != NULL) {
+		*delim = '\0';
 	}
 
 	rc = inet_aton(str, &addr);
@@ -343,10 +364,10 @@ dpg_parse_ip_interval(char *str, uint32_t *ip_start, uint32_t *ip_end)
 	}
 	*ip_start = rte_be_to_cpu_32(addr.s_addr);
 
-	if (ptr == NULL) {
+	if (delim == NULL) {
 		*ip_end = *ip_start;
 	} else {
-		rc = inet_aton(ptr + 1, &addr);
+		rc = inet_aton(delim + 1, &addr);
 		if (rc == 0) {
 			return -EINVAL;
 		}
@@ -354,6 +375,36 @@ dpg_parse_ip_interval(char *str, uint32_t *ip_start, uint32_t *ip_end)
 		if (*ip_end < *ip_start) {
 			return -EINVAL;
 		}
+	}
+
+	return 0;
+}
+
+static int
+dpg_parse_icmp_id_interval(char *str, uint16_t *id_start, uint16_t *id_end)
+{
+	unsigned long ul;
+	char *delim, *endptr;
+
+	delim = strchr(str, '-');
+	if (delim != NULL) {
+		*delim = '\0';
+	}
+
+	ul = strtoul(str, &endptr, 10);
+	if (*endptr != '\0' || ul > UINT16_MAX) {
+		return -EINVAL;
+	}
+	*id_start = ul;
+
+	if (delim == NULL) {
+		*id_end = *id_start;
+	} else {
+		ul = strtoul(delim + 1, &endptr, 10);
+		if (*endptr != '\0' || ul > UINT16_MAX || ul < *id_start) {
+			return -EINVAL;
+		}
+		*id_end = ul;
 	}
 
 	return 0;
@@ -370,7 +421,7 @@ dpg_port_name(struct dpg_port *port, struct rte_eth_dev_info *dev_info)
 		return "???";
 	}
 
-	return dev_info->device->name;
+	return dpg_dev_name(dev_info->device);
 }
 
 static int
@@ -387,7 +438,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 	job = malloc(sizeof(*job));
 	memcpy(job, tmpl, sizeof(*job));
 
-	while ((opt = getopt(argc, argv, "hl:p:q:REB:D:s:d:")) != -1) {
+	while ((opt = getopt(argc, argv, "hl:p:q:REB:A:s:d:i:")) != -1) {
 		switch (opt) {
 		case 'h':
 			dpg_print_usage();
@@ -434,7 +485,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			}
 			break;
 
-		case 'D':
+		case 'A':
 			rc = rte_ether_unformat_addr(optarg, &job->dst_eth_addr);
 			if (rc != 0) {
 				dpg_invalid_argument(opt);
@@ -450,6 +501,14 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 
 		case 'd':
 			rc = dpg_parse_ip_interval(optarg, &job->dst_ip_start, &job->dst_ip_end);
+			if (rc < 0) {
+				dpg_invalid_argument(opt);
+			}
+			break;
+
+		case 'i':
+			rc = dpg_parse_icmp_id_interval(optarg, &job->icmp_id_start,
+					&job->icmp_id_end);
 			if (rc < 0) {
 				dpg_invalid_argument(opt);
 			}
@@ -526,16 +585,17 @@ dpg_create_icmp_request(struct dpg_job *job)
 	ich->icmp_type = RTE_IP_ICMP_ECHO_REQUEST;
 	ich->icmp_code = 0;
 	ich->icmp_cksum = 0;
-	ich->icmp_ident = RTE_BE16(1);
+
+	ich->icmp_ident = rte_cpu_to_be_16(job->icmp_id_current);
 	ich->icmp_seq_nb = rte_cpu_to_be_16(job->icmp_seq_nb);
 
 	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
 	ich->icmp_cksum = dpg_cksum(ich, sizeof(*ich));
 
-	if (job->icmp_seq_nb < DPG_ICMP_SEQ_NB_END) {
-		job->icmp_seq_nb++;
+	if (job->icmp_id_current < job->icmp_id_end) {
+		job->icmp_id_current++;
 	} else {
-		job->icmp_seq_nb = DPG_ICMP_SEQ_NB_START;
+		job->icmp_id_current = job->icmp_id_start;
 		if (job->src_ip_current < job->src_ip_end) {
 			job->src_ip_current++;
 		} else {
@@ -544,6 +604,11 @@ dpg_create_icmp_request(struct dpg_job *job)
 				job->dst_ip_current++;
 			} else {
 				job->dst_ip_current = job->dst_ip_start;
+				if (job->icmp_seq_nb < DPG_ICMP_SEQ_NB_END) {
+					job->icmp_seq_nb++;
+				} else {
+					job->icmp_seq_nb = DPG_ICMP_SEQ_NB_START;
+				}
 			}
 		}
 	}
@@ -621,11 +686,11 @@ drop:
 		}
 	}
 
-	txed = 0;
-//	while (txed < n_tx) {
-		txed += rte_eth_tx_burst(job->port_id, job->queue_id,
-				tx_pkts + txed, n_tx - txed);
-//	}
+	if (!n_tx) {
+		return;
+	}
+	
+	txed = rte_eth_tx_burst(job->port_id, job->queue_id, tx_pkts, n_tx);
 
 	for (i = txed; i < n_tx; ++i) {
 		rte_pktmbuf_free(tx_pkts[i]);
@@ -690,6 +755,7 @@ lcore_loop(void *dummy)
 		job->icmp_seq_nb = DPG_ICMP_SEQ_NB_START;
 		job->src_ip_current = job->src_ip_start;
 		job->dst_ip_current = job->dst_ip_start;
+		job->icmp_id_current = job->icmp_id_start;
 	}
 	
 	if (lcore->is_first) {
@@ -738,6 +804,7 @@ int
 main(int argc, char **argv)
 {
 	int i, j, rc, n_rxq, n_txq, n_mbufs, main_lcore, first_lcore;
+	char mac_addr_buf[RTE_ETHER_ADDR_FMT_SIZE];
 	const char *port_name;
 	struct rte_eth_dev_info dev_info;
 	struct rte_eth_rxconf rxq_conf;
@@ -754,15 +821,17 @@ main(int argc, char **argv)
 	argc -= rc;
 	argv += rc;
 
+	main_lcore = rte_lcore_id();
 	tmpl = &tmpl_instance;
 	memset(tmpl, 0, sizeof(*tmpl));
-	tmpl->lcore_id = rte_get_main_lcore();
+	tmpl->lcore_id = main_lcore;
 	tmpl->bandwidth = 100000000llu; // 100 mpps
 	for (i = 0; i < DPG_ARRAY_SIZE(tmpl->dst_eth_addr.addr_bytes); ++i) {
 		tmpl->dst_eth_addr.addr_bytes[i] = 0xFF;
 	}
 	dpg_parse_ip_interval("1.1.1.1", &tmpl->src_ip_start, &tmpl->src_ip_end);
 	dpg_parse_ip_interval("2.2.2.2", &tmpl->dst_ip_start, &tmpl->dst_ip_end);
+	tmpl->icmp_id_start = tmpl->icmp_id_end = 1;
 
 	while (argc > 1) {
 		rc = dpg_parse_job(&job, tmpl, argc, argv);
@@ -817,6 +886,9 @@ main(int argc, char **argv)
 					port_name, -rc, rte_strerror(-rc));
 		}
 
+		rte_ether_format_addr(mac_addr_buf, sizeof(mac_addr_buf), &port->mac_addr);
+		printf("Port '%s': %s\n", port_name, mac_addr_buf);
+
 		n_mbufs += n_rxq * port->n_rxd;
 		n_mbufs += n_txq * (port->n_txd + DPG_MAX_PKT_BURST);
 	}
@@ -870,13 +942,13 @@ main(int argc, char **argv)
 
 		rc = rte_eth_promiscuous_enable(i);
 		if (rc < 0) {
-			dpg_die("rte_eth_promiscuous_enable('%s') failed (%d:%s)\n",
+			printf("rte_eth_promiscuous_enable('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
 		}
 
 		rc = rte_eth_dev_set_link_up(i);
 		if (rc < 0) {
-			dpg_die("rte_eth_dev_set_link_up('%s') failed (%d:%s)\n",
+			printf("rte_eth_dev_set_link_up('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
 		}
 	}
@@ -885,7 +957,6 @@ main(int argc, char **argv)
 	dpg_set_microseconds();
 
 	first_lcore = -1;
-	main_lcore = rte_get_main_lcore();
 	RTE_LCORE_FOREACH(i) {
 		lcore = g_lcores + i;
 		if (lcore->jobs == NULL) {
