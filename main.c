@@ -20,6 +20,9 @@
 #define DPG_ICMP_SEQ_NB_START 1
 #define DPG_ICMP_SEQ_NB_END 50000
 
+#define	DPG_ARP_OP_REQUEST 1
+#define	DPG_ARP_OP_REPLY 2
+
 #define DPG_MEMPOOL_CACHE_SIZE 128
 #define DPG_MAX_PKT_BURST 128
 
@@ -61,7 +64,23 @@ struct dpg_ether_hdr {
 	struct rte_ether_addr dst_addr;
 	struct rte_ether_addr src_addr;
 	uint16_t ether_type;
-}  __attribute__((aligned (2)));
+}  __attribute__((aligned(2)));
+
+// 14
+
+struct dpg_arp_hdr {
+	rte_be16_t arp_hardware; // 0
+	rte_be16_t arp_protocol; // 2
+	uint8_t    arp_hlen; // 4
+	uint8_t    arp_plen; // 5
+	rte_be16_t arp_opcode; // 6
+	struct rte_ether_addr arp_sha; // 8
+	rte_be32_t            arp_sip; // 14
+	struct rte_ether_addr arp_tha; // 18
+	rte_be32_t            arp_tip; // 24
+} __attribute__((packed));
+
+// 28
 
 struct dpg_ipv4_hdr {
         union {
@@ -542,6 +561,13 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 	return optind;
 }
 
+static void
+dpg_set_ether_hdr_addresses(struct dpg_job *job, struct dpg_ether_hdr *eh)
+{
+	rte_ether_addr_copy(&job->dst_eth_addr, &eh->dst_addr);
+	rte_ether_addr_copy(&g_ports[job->port_id].mac_addr, &eh->src_addr);
+}
+
 static struct rte_mbuf *
 dpg_create_icmp_request(struct dpg_job *job)
 {
@@ -549,9 +575,6 @@ dpg_create_icmp_request(struct dpg_job *job)
 	struct dpg_ether_hdr *eh;
 	struct dpg_ipv4_hdr *ih;
 	struct dpg_icmp_hdr *ich;
-	struct dpg_port *port;
-
-	port = g_ports + job->port_id;
 
 	m = rte_pktmbuf_alloc(g_pktmbuf_pool);
 	if (m == NULL) {
@@ -567,8 +590,7 @@ dpg_create_icmp_request(struct dpg_job *job)
 	ich = (struct dpg_icmp_hdr *)(ih + 1);
 
 	eh->ether_type = RTE_BE16(RTE_ETHER_TYPE_IPV4);
-	rte_ether_addr_copy(&job->dst_eth_addr, &eh->dst_addr);
-	rte_ether_addr_copy(&port->mac_addr, &eh->src_addr);
+	dpg_set_ether_hdr_addresses(job, eh);
 
 	ih->version = 4;
 	ih->ihl = sizeof(*ih) / sizeof(uint32_t);
@@ -616,14 +638,79 @@ dpg_create_icmp_request(struct dpg_job *job)
 	return m;
 }
 
-static void
-dpg_do_job(struct dpg_job *job)
+static int
+dpg_ip_input(struct dpg_job *job, struct rte_mbuf *m)
 {
-	int i, n_rx, n_tx, n_reqs, tx_burst, txed;
-	uint64_t now, dt;
+	int hl;
 	struct dpg_ether_hdr *eh;
 	struct dpg_ipv4_hdr *ih;
 	struct dpg_icmp_hdr *ich;
+
+	eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
+	ih = (struct dpg_ipv4_hdr *)(eh + 1);
+	if (m->pkt_len < sizeof(*eh) + sizeof(*ih)) {
+		return -EINVAL;
+	}
+
+	hl = ih->ihl * sizeof(uint32_t);
+	if (hl < sizeof(*ih)) {
+		return -EINVAL;
+	}
+	if (m->pkt_len < sizeof(*eh) + hl) {
+		return -EINVAL;
+	}
+
+	if (ih->next_proto_id != IPPROTO_ICMP) {
+		return -EINVAL;
+	}
+
+	ich = (struct dpg_icmp_hdr *)((uint8_t *)ih + hl);
+	if (ich->icmp_type != RTE_IP_ICMP_ECHO_REQUEST) {
+		return -EINVAL;
+	}
+
+	ich->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
+	DPG_SWAP(ih->src_addr, ih->dst_addr);
+	DPG_SWAP(eh->src_addr, eh->dst_addr);
+
+	ich->icmp_cksum = 0;
+	ich->icmp_cksum = dpg_cksum(ich, sizeof(*ich));
+	ih->hdr_checksum = 0;
+	ih->hdr_checksum = dpg_cksum(ih, hl);
+
+	return 0;
+}
+
+static int
+dpg_arp_input(struct dpg_job *job, struct rte_mbuf *m)
+{
+	struct dpg_ether_hdr *eh;
+	struct dpg_arp_hdr *ah;
+
+	eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
+	if (m->pkt_len < sizeof(*eh) + sizeof(*ah)) {
+		return -EINVAL;
+	}
+
+	ah = (struct dpg_arp_hdr *)(eh + 1);
+	if (ah->arp_opcode != RTE_BE16(DPG_ARP_OP_REQUEST)) {
+		return -EINVAL;
+	}
+
+	ah->arp_opcode = RTE_BE16(DPG_ARP_OP_REPLY);
+	ah->arp_tha = job->dst_eth_addr;
+	ah->arp_sha = g_ports[job->port_id].mac_addr;
+	DPG_SWAP(ah->arp_tip, ah->arp_sip);
+
+	return 0;
+}
+
+static void
+dpg_do_job(struct dpg_job *job)
+{
+	int i, rc, n_rx, n_tx, n_reqs, tx_burst, txed;
+	uint64_t now, dt;
+	struct dpg_ether_hdr *eh;
 	struct rte_mbuf *m, *rx_pkts[DPG_MAX_PKT_BURST], *tx_pkts[DPG_MAX_PKT_BURST];
 
 	n_tx = 0;
@@ -633,32 +720,35 @@ dpg_do_job(struct dpg_job *job)
 
 	for (i = 0; i < n_rx; ++i) {
 		m = rx_pkts[i];
-		if (job->echo == 0) {
-			goto drop;
-		}
 		eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
-		if (eh->ether_type != RTE_BE16(RTE_ETHER_TYPE_IPV4)) {
-			goto drop;
-		} 
-
-		ih = (struct dpg_ipv4_hdr *)(eh + 1);
-		if (ih->next_proto_id != IPPROTO_ICMP) {
+		if (m->pkt_len < sizeof(*eh)) {
 			goto drop;
 		}
 
-		ich = (struct dpg_icmp_hdr *)(ih + 1);
-		if (ich->icmp_type != RTE_IP_ICMP_ECHO_REQUEST) {
+		switch (eh->ether_type) {
+		case RTE_BE16(RTE_ETHER_TYPE_IPV4):
+			if (job->echo == 0) {
+				goto drop;
+			}
+
+			rc = dpg_ip_input(job, m);
+			if (rc < 0) {
+				goto drop;
+			}
+			break;
+		
+		case RTE_BE16(RTE_ETHER_TYPE_ARP):
+			rc = dpg_arp_input(job, m);
+			if (rc < 0) {
+				goto drop;
+			}
+			break;
+
+		default:
 			goto drop;
 		}
 
-		ich->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
-		DPG_SWAP(ih->src_addr, ih->dst_addr);
-		DPG_SWAP(eh->src_addr, eh->dst_addr);
-
-		ich->icmp_cksum = 0;
-		ich->icmp_cksum = dpg_cksum(ich, sizeof(*ich));
-		ih->hdr_checksum = 0;
-		ih->hdr_checksum = dpg_cksum(ih, ih->ihl * sizeof(uint32_t));
+		dpg_set_ether_hdr_addresses(job, eh);
 
 		tx_pkts[n_tx++] = m;
 		continue;
