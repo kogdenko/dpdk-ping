@@ -145,6 +145,8 @@ struct dpg_job {
 	uint16_t icmp_id_start;
 	uint16_t icmp_id_end;
 
+	int n_tx_pkts;
+	struct rte_mbuf *tx_pkts[DPG_MAX_PKT_BURST];
 };
 
 struct dpg_port {
@@ -708,12 +710,11 @@ dpg_arp_input(struct dpg_job *job, struct rte_mbuf *m)
 static void
 dpg_do_job(struct dpg_job *job)
 {
-	int i, rc, n_rx, n_tx, n_reqs, tx_burst, txed;
+	int i, rc, n_rx, n_reqs, tx_burst, txed;
 	uint64_t now, dt;
 	struct dpg_ether_hdr *eh;
-	struct rte_mbuf *m, *rx_pkts[DPG_MAX_PKT_BURST], *tx_pkts[DPG_MAX_PKT_BURST];
+	struct rte_mbuf *m, *rx_pkts[DPG_MAX_PKT_BURST];
 
-	n_tx = 0;
 	n_rx = rte_eth_rx_burst(job->port_id, job->queue_id, rx_pkts, DPG_ARRAY_SIZE(rx_pkts));
 
 	dpg_counter_add(&g_ipackets, n_rx);
@@ -750,41 +751,43 @@ dpg_do_job(struct dpg_job *job)
 
 		dpg_set_ether_hdr_addresses(job, eh);
 
-		tx_pkts[n_tx++] = m;
-		continue;
+		if (job->n_tx_pkts < DPG_ARRAY_SIZE(job->tx_pkts)) {
+			job->tx_pkts[job->n_tx_pkts++] = m;
+			continue;
+		}
 drop:
 		rte_pktmbuf_free(m);
 	}
 
-	if (job->request) {
+	if (job->request && job->n_tx_pkts < DPG_ARRAY_SIZE(job->tx_pkts)) {
 		now = g_microseconds;
 		dt = now - job->last_tx_time;
 		n_reqs = job->bandwidth * dt / 1000000;
 
-		if (n_reqs >= DPG_ARRAY_SIZE(tx_pkts) - n_tx) {
-			n_reqs = DPG_ARRAY_SIZE(tx_pkts) - n_tx;
+		if (n_reqs >= DPG_ARRAY_SIZE(job->tx_pkts) - job->n_tx_pkts) {
+			n_reqs = DPG_ARRAY_SIZE(job->tx_pkts) - job->n_tx_pkts;
 			job->last_tx_time = now;
 			
 		} else {
 			job->last_tx_time += n_reqs * 1000000 / job->bandwidth;
 		}
 
-		tx_burst = n_tx + n_reqs;
+		tx_burst = job->n_tx_pkts + n_reqs;
+//		tx_burst = DPG_ARRAY_SIZE(job->tx_pkts) - job->n_tx_pkts;
 
-		while (n_tx < tx_burst) {
-			tx_pkts[n_tx++] = dpg_create_icmp_request(job);
+		while (job->n_tx_pkts < tx_burst) {
+			job->tx_pkts[job->n_tx_pkts++] = dpg_create_icmp_request(job);
 		}
 	}
 
-	if (!n_tx) {
+	if (!job->n_tx_pkts) {
 		return;
 	}
 	
-	txed = rte_eth_tx_burst(job->port_id, job->queue_id, tx_pkts, n_tx);
-
-	for (i = txed; i < n_tx; ++i) {
-		rte_pktmbuf_free(tx_pkts[i]);
-	}
+	txed = rte_eth_tx_burst(job->port_id, job->queue_id, job->tx_pkts, job->n_tx_pkts);
+	memmove(job->tx_pkts, job->tx_pkts + txed,
+			(job->n_tx_pkts - txed) * sizeof (struct rte_mbuf *));
+	job->n_tx_pkts -= txed;
 
 	dpg_counter_add(&g_opackets, txed);
 }
