@@ -103,9 +103,7 @@ struct dpg_arp_hdr {
 	rte_be32_t arp_sip;
 	dpg_ether_addr_t arp_tha;
 	rte_be32_t arp_tip;
-} __attribute__((packed));
-
-// 28
+} __attribute__((aligned(2)));
 
 struct dpg_ipv4_hdr {
         union {
@@ -129,7 +127,7 @@ struct dpg_ipv4_hdr {
 	rte_be16_t hdr_checksum;
 	rte_be32_t src_addr;
 	rte_be32_t dst_addr;
-} __attribute__((packed));
+} __attribute__((aligned(2)));
 
 struct dpg_icmp_hdr {
 	uint8_t  icmp_type;
@@ -137,7 +135,7 @@ struct dpg_icmp_hdr {
 	rte_be16_t icmp_cksum;
 	rte_be16_t icmp_ident;
 	rte_be16_t icmp_seq_nb;
-} __attribute__((packed));
+} __attribute__((aligned(2)));
 
 struct dpg_job {
 	struct dpg_job *lcore_next;
@@ -276,8 +274,10 @@ dpg_invalid_argument(int arg)
 static void
 dpg_print_usage()
 {
-	rte_exit(EXIT_SUCCESS,
-	"Usage: dpdk-ping [DPDK options] -- job [-- job [-- job ...]]\n"
+	int port_id;
+	char port_name[RTE_ETH_NAME_MAX_LEN];
+
+	printf("Usage: dpdk-ping [DPDK options] -- job [-- job [-- job ...]]\n"
 	"\n"
 	"Job:\n"
 	"\t-h:  Print this help\n"
@@ -291,8 +291,15 @@ dpg_print_usage()
 	"\t-s {ip[-ip]}:  Source ip addresses interval\n"
 	"\t-d {ip[-ip]}:  Destination ip addresses interval\n"
 	"\t-i {icmp id[-icmp id]}:  ICMP request id interval\n"
-	"\n"
+	"Ports:\n"
 	);
+
+	RTE_ETH_FOREACH_DEV(port_id) {
+		rte_eth_dev_get_name_by_port(port_id, port_name);
+		printf("%s\n", port_name);
+	}
+
+	rte_exit(EXIT_SUCCESS, "\n");
 }
 
 static inline uint64_t
@@ -461,27 +468,13 @@ dpg_parse_icmp_id_interval(char *str, uint16_t *id_start, uint16_t *id_end)
 	return 0;
 }
 
-static const char *
-dpg_port_name(struct dpg_port *port, struct rte_eth_dev_info *dev_info)
-{
-	int port_id;
-
-	port_id = port - g_ports;
-	rte_eth_dev_info_get(port_id, dev_info);
-	if (dev_info->device == NULL) {
-		return "???";
-	}
-
-	return dpg_dev_name(dev_info->device);
-}
-
 static int
 dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv)
 {
 	int rc, opt; 
 	uint16_t port_id;
 	char *endptr;
-	struct rte_eth_dev_info dev_info;
+	char port_name[RTE_ETH_NAME_MAX_LEN];
 	struct dpg_job *job, *tmp;
 	struct dpg_lcore *lcore;
 	struct dpg_port *port;
@@ -507,11 +500,17 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			break;
 
 		case 'p':
-			rc = rte_eth_dev_get_port_by_name(optarg, &port_id);
-			if (rc != 0) {
+			job->port_id = -1;
+			RTE_ETH_FOREACH_DEV(port_id) {
+				rte_eth_dev_get_name_by_port(port_id, port_name);
+				if (!strcmp(optarg, port_name)) {
+					job->port_id = port_id;
+					break;
+				}
+			}
+			if (job->port_id < 0) {
 				dpg_die("DPDK doesn't run on port '%s'\n", optarg);		
 			}
-			job->port_id = port_id;
 			break;
 
 		case 'q':
@@ -579,8 +578,9 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 	port = g_ports + job->port_id;
 	for (tmp = port->jobs; tmp != NULL; tmp = tmp->port_next) {
 		if (job->queue_id == tmp->queue_id) {
+			rte_eth_dev_get_name_by_port(job->port_id, port_name);
 			dpg_die("Duplicate job for port '%s' queue %d\n",
-					dpg_port_name(port, &dev_info), job->queue_id);
+					port_name, job->queue_id);
 		}
 	}
 	port->n_queues = DPG_MAX(port->n_queues, job->queue_id + 1);
@@ -803,7 +803,6 @@ drop:
 		}
 
 		tx_burst = job->n_tx_pkts + n_reqs;
-//		tx_burst = DPG_ARRAY_SIZE(job->tx_pkts) - job->n_tx_pkts;
 
 		while (job->n_tx_pkts < tx_burst) {
 			job->tx_pkts[job->n_tx_pkts++] = dpg_create_icmp_request(job);
@@ -832,18 +831,18 @@ dpg_set_microseconds(void)
 static void
 dpg_get_stats(uint64_t *ipackets, uint64_t *opackets)
 {
-	int i;
+	int port_id;
 	struct rte_eth_stats stats;
 
 	*ipackets = 0;
 	*opackets = 0;
 
-	for (i = 0; i < DPG_ARRAY_SIZE(g_ports); ++i) {
-		if (!dpg_port_is_configured(g_ports + i)) {
+	RTE_ETH_FOREACH_DEV(port_id) {
+		if (!dpg_port_is_configured(g_ports + port_id)) {
 			continue;
 		}
 
-		rte_eth_stats_get(i, &stats);
+		rte_eth_stats_get(port_id, &stats);
 
 		*ipackets += stats.ipackets;
 		*opackets += stats.opackets;
@@ -926,9 +925,9 @@ lcore_loop(void *dummy)
 int
 main(int argc, char **argv)
 {
-	int i, j, rc, n_rxq, n_txq, n_mbufs, main_lcore, first_lcore;
+	int i, rc, port_id, n_rxq, n_txq, n_mbufs, main_lcore, first_lcore;
 	char mac_addr_buf[DPG_ETHER_ADDR_FMT_SIZE];
-	const char *port_name;
+	char port_name[RTE_ETH_NAME_MAX_LEN];
 	struct rte_eth_dev_info dev_info;
 	struct rte_eth_rxconf rxq_conf;
 	struct rte_eth_txconf txq_conf;
@@ -968,13 +967,19 @@ main(int argc, char **argv)
 
 	n_mbufs = DPG_MEMPOOL_CACHE_SIZE;
 
-	for (i = 0; i < DPG_ARRAY_SIZE(g_ports); ++i) {
-		port = g_ports + i;
+	RTE_ETH_FOREACH_DEV(port_id) {
+		port = g_ports + port_id;
 		if (!dpg_port_is_configured(port)) {
 			continue;
 		}
 
-		port_name = dpg_port_name(port, &dev_info);
+		rte_eth_dev_get_name_by_port(port_id, port_name);
+
+		rc = rte_eth_dev_info_get(port_id, &dev_info);
+		if (rc < 0) {
+			dpg_die("rte_eth_dev_info_get('%s') failed (%d:%s)\n",
+					port_name, -rc, rte_strerror(-rc));
+		}
 
 		port->conf = g_port_conf;
 		if (dev_info.tx_offload_capa & DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
@@ -988,7 +993,7 @@ main(int argc, char **argv)
 		}
 
 		n_rxq = n_txq = port->n_queues;
-		rc = rte_eth_dev_configure(i, n_rxq, n_txq, &port->conf);
+		rc = rte_eth_dev_configure(port_id, n_rxq, n_txq, &port->conf);
 		if (rc < 0) {
 			dpg_die("rte_eth_dev_configure('%s', %d, %d) failed (%d:%s)\n",
 					port_name, n_rxq, n_txq,
@@ -997,13 +1002,13 @@ main(int argc, char **argv)
 
 		port->n_rxd = 4096;
 		port->n_txd = 4096;
-		rc = rte_eth_dev_adjust_nb_rx_tx_desc(i, &port->n_rxd, &port->n_txd);
+		rc = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &port->n_rxd, &port->n_txd);
 		if (rc < 0) {
 			dpg_die("rte_eth_dev_adjust_nb_rx_tx_desc('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
 		}
 
-		rc = dpg_eth_macaddr_get(i, &port->mac_addr);
+		rc = dpg_eth_macaddr_get(port_id, &port->mac_addr);
 		if (rc < 0) {
 			dpg_die("rte_eth_macaddr_get('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
@@ -1026,46 +1031,52 @@ main(int argc, char **argv)
 		dpg_die("rte_pktmbuf_pool_create(%d) failed\n", n_mbufs);
 	}
 
-	for (i = 0; i < DPG_ARRAY_SIZE(g_ports); ++i) {
-		port = g_ports + i;
+	RTE_ETH_FOREACH_DEV(port_id) {
+		port = g_ports + port_id;
 		if (!dpg_port_is_configured(port)) {
 			continue;
 		}
 
-		port_name = dpg_port_name(port, &dev_info);
+		rte_eth_dev_get_name_by_port(port_id, port_name);
 
-		for (j = 0; j < port->n_queues; ++j) {
+		rc = rte_eth_dev_info_get(port_id, &dev_info);
+		if (rc < 0) {
+			dpg_die("rte_eth_dev_info_get('%s') failed (%d:%s)\n",
+					port_name, -rc, rte_strerror(-rc));
+		}
+
+		for (i = 0; i < port->n_queues; ++i) {
 			rxq_conf = dev_info.default_rxconf;
 			rxq_conf.offloads = port->conf.rxmode.offloads;
-			rc = rte_eth_rx_queue_setup(i, j, port->n_rxd,
-					rte_eth_dev_socket_id(i),
+			rc = rte_eth_rx_queue_setup(port_id, i, port->n_rxd,
+					rte_eth_dev_socket_id(port_id),
 					&rxq_conf,
 					g_pktmbuf_pool);
 			if (rc < 0) {
 				dpg_die("rte_eth_rx_queue_setup('%s', %d, %d) failed (%d:%s)\n",
-						port_name, i, j, -rc, rte_strerror(-rc));
+						port_name, port_id, i, -rc, rte_strerror(-rc));
 			}
 
 			txq_conf = dev_info.default_txconf;
 			txq_conf.offloads = port->conf.txmode.offloads;
-			rc = rte_eth_tx_queue_setup(i, j, port->n_txd,
-					rte_eth_dev_socket_id(i),
+			rc = rte_eth_tx_queue_setup(port_id, i, port->n_txd,
+					rte_eth_dev_socket_id(port_id),
 					&txq_conf);
 			if (rc < 0) {
 				dpg_die("rte_eth_tx_queue_setup('%s', %d, %d) failed (%d:%s)\n",
-						port_name, i, j, -rc, rte_strerror(-rc));
+						port_name, port_id, i, -rc, rte_strerror(-rc));
 			}
 		}
 
-		rc = rte_eth_dev_start(i);
+		rc = rte_eth_dev_start(port_id);
 		if (rc < 0) {
 			dpg_die("rte_eth_dev_start('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
 		}
 
-		rte_eth_promiscuous_enable(i);
+		rte_eth_promiscuous_enable(port_id);
 
-		rc = rte_eth_dev_set_link_up(i);
+		rc = rte_eth_dev_set_link_up(port_id);
 		if (rc < 0) {
 			printf("rte_eth_dev_set_link_up('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
