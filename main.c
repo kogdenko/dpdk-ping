@@ -9,6 +9,7 @@
 
 #include <rte_bus.h>
 #include <rte_common.h>
+#include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
@@ -17,8 +18,18 @@
 
 #define DPG_USE_HARDWARE_COUNTERS
 
+#define DPG_ETHER_ADDR_FMT_SIZE 18
+
+#define DPG_IP_ICMP_ECHO_REPLY 0
+#define DPG_IP_ICMP_ECHO_REQUEST 8
+
 #define DPG_ICMP_SEQ_NB_START 1
 #define DPG_ICMP_SEQ_NB_END 50000
+
+#define DPG_ETHER_TYPE_ARP 0x0806
+#define DPG_ETHER_TYPE_IPV4 0x0800
+
+#define DPG_IPV4_HDR_DF_FLAG (1 << 6)
 
 #define	DPG_ARP_OP_REQUEST 1
 #define	DPG_ARP_OP_REPLY 2
@@ -35,12 +46,11 @@
 		DPG_PPSTR(RTE_VER_MINOR)"." \
 		DPG_PPSTR(RTE_VER_RELEASE)
 
-#if RTE_VERSION < RTE_VERSION_NUM(19, 11, 14, 99)
-#error "Not tested DPDK version"
+#if RTE_VERSION < RTE_VERSION_NUM(18, 5, 0, 16)
+#error "Too old DPDK version (not tested)"
 #endif
 
-// TODO: Findout exact version when changes took place
-#if RTE_VERSION <= RTE_VERSION_NUM(20, 11, 0, 99) 
+#if RTE_VERSION <= RTE_VERSION_NUM(21, 8, 0, 99) 
 #define DPG_ETH_MQ_TX_NONE ETH_MQ_TX_NONE
 #define DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE DEV_TX_OFFLOAD_MBUF_FAST_FREE
 #define DPG_ETH_MQ_RX_RSS ETH_MQ_RX_RSS
@@ -48,6 +58,7 @@
 #define DPG_ETH_RSS_TCP ETH_RSS_TCP
 #define DPG_ETH_RSS_UDP ETH_RSS_UDP
 #else
+// 21.11.0.99
 #define DPG_ETH_MQ_TX_NONE RTE_ETH_MQ_TX_NONE
 #define DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE
 #define DPG_ETH_MQ_RX_RSS RTE_ETH_MQ_RX_RSS
@@ -56,28 +67,42 @@
 #define DPG_ETH_RSS_UDP RTE_ETH_RSS_UDP
 #endif
 
+#if RTE_VERSION <= RTE_VERSION_NUM(19, 5, 0, 99)
+typedef struct ether_addr dpg_ether_addr_t;
+#define dpg_ether_format_addr ether_format_addr
+#else
+// 19, 8, 0, 99
+typedef struct rte_ether_addr dpg_ether_addr_t;
+#define dpg_ether_format_addr rte_ether_format_addr
+#endif
+
+#if RTE_VERSION <= RTE_VERSION_NUM(22, 7, 0, 99)
+#define dpg_dev_name(dev) ((dev)->name)
+#else
+// 22.11.0.99
+#define dpg_dev_name(dev) rte_dev_name(dev)
+#endif
+
 struct dpg_counter {
 	uint64_t per_lcore[RTE_MAX_LCORE];
 };
 
 struct dpg_ether_hdr {
-	struct rte_ether_addr dst_addr;
-	struct rte_ether_addr src_addr;
+	dpg_ether_addr_t dst_addr;
+	dpg_ether_addr_t src_addr;
 	uint16_t ether_type;
 }  __attribute__((aligned(2)));
 
-// 14
-
 struct dpg_arp_hdr {
-	rte_be16_t arp_hardware; // 0
-	rte_be16_t arp_protocol; // 2
-	uint8_t    arp_hlen; // 4
-	uint8_t    arp_plen; // 5
-	rte_be16_t arp_opcode; // 6
-	struct rte_ether_addr arp_sha; // 8
-	rte_be32_t            arp_sip; // 14
-	struct rte_ether_addr arp_tha; // 18
-	rte_be32_t            arp_tip; // 24
+	rte_be16_t arp_hardware;
+	rte_be16_t arp_protocol;
+	uint8_t arp_hlen;
+	uint8_t arp_plen;
+	rte_be16_t arp_opcode;
+	dpg_ether_addr_t arp_sha;
+	rte_be32_t arp_sip;
+	dpg_ether_addr_t arp_tha;
+	rte_be32_t arp_tip;
 } __attribute__((packed));
 
 // 28
@@ -129,7 +154,7 @@ struct dpg_job {
 	uint64_t bandwidth;
 	uint64_t last_tx_time;
 
-	struct rte_ether_addr dst_eth_addr;
+	dpg_ether_addr_t dst_eth_addr;
 
 	uint32_t icmp_seq_nb;
 
@@ -153,7 +178,7 @@ struct dpg_port {
 	uint16_t n_rxd;
 	uint16_t n_txd;
 	int n_queues;
-	struct rte_ether_addr mac_addr;
+	dpg_ether_addr_t mac_addr;
 	struct dpg_job *jobs;
 	struct rte_eth_conf conf;
 };
@@ -189,13 +214,6 @@ static struct rte_eth_conf g_port_conf = {
 #define dpg_die(...) \
 	rte_exit(EXIT_FAILURE, ##__VA_ARGS__);
 
-// TODO: Findout exact version when changes took place
-#if RTE_VERSION < RTE_VERSION_NUM(23, 11, 0, 99) 
-#define dpg_dev_name(dev) ((dev)->name)
-#else
-#define dpg_dev_name(dev) rte_dev_name(dev)
-#endif
-
 #ifdef DPG_USE_HARDWARE_COUNTERS
 #define dpg_counter_add(c, add)
 #define dpg_counter_get(c) 0
@@ -220,6 +238,34 @@ dpg_counter_get(struct dpg_counter *c)
 	return sum;
 }
 #endif
+
+static int
+dpg_ether_unformat_addr(const char *s, dpg_ether_addr_t *a)
+{
+	int rc;
+
+	rc = sscanf(s, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+			(a)->addr_bytes + 0, a->addr_bytes + 1, a->addr_bytes + 2,
+			(a)->addr_bytes + 3, a->addr_bytes + 4, a->addr_bytes + 5);
+
+	return rc == 6 ? 0 : -EINVAL;
+}
+
+static int
+dpg_eth_macaddr_get(uint16_t port_id, dpg_ether_addr_t *mac_addr)
+{
+	int rc;
+
+#if RTE_VERSION <= RTE_VERSION_NUM(19, 8, 0, 99)
+	rc = rte_eth_macaddr_get(port_id, mac_addr);
+#else
+	// 19.11.0.99
+	rte_eth_macaddr_get(port_id, mac_addr);
+	rc = 0;
+#endif
+
+	return rc;
+}
 
 static void
 dpg_invalid_argument(int arg)
@@ -248,22 +294,6 @@ dpg_print_usage()
 	"\n"
 	);
 }
-
-/*static char *
-dpg_strzcpy(char *dest, const char *src, size_t n)
-{
-	size_t i;
-
-	for (i = 0; i < n - 1; ++i) {
-		if (src[i] == '\0') {
-			break;
-		}
-		dest[i] = src[i];
-	}
-
-	dest[i] = '\0';
-	return dest;
-}*/
 
 static inline uint64_t
 dpg_cksum_add(uint64_t sum, uint64_t x)
@@ -507,7 +537,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			break;
 
 		case 'A':
-			rc = rte_ether_unformat_addr(optarg, &job->dst_eth_addr);
+			rc = dpg_ether_unformat_addr(optarg, &job->dst_eth_addr);
 			if (rc != 0) {
 				dpg_invalid_argument(opt);
 			}
@@ -566,8 +596,8 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 static void
 dpg_set_ether_hdr_addresses(struct dpg_job *job, struct dpg_ether_hdr *eh)
 {
-	rte_ether_addr_copy(&job->dst_eth_addr, &eh->dst_addr);
-	rte_ether_addr_copy(&g_ports[job->port_id].mac_addr, &eh->src_addr);
+	eh->dst_addr = job->dst_eth_addr;
+	eh->src_addr = g_ports[job->port_id].mac_addr;
 }
 
 static struct rte_mbuf *
@@ -591,7 +621,7 @@ dpg_create_icmp_request(struct dpg_job *job)
 	ih = (struct dpg_ipv4_hdr *)(eh + 1);
 	ich = (struct dpg_icmp_hdr *)(ih + 1);
 
-	eh->ether_type = RTE_BE16(RTE_ETHER_TYPE_IPV4);
+	eh->ether_type = RTE_BE16(DPG_ETHER_TYPE_IPV4);
 	dpg_set_ether_hdr_addresses(job, eh);
 
 	ih->version = 4;
@@ -599,14 +629,14 @@ dpg_create_icmp_request(struct dpg_job *job)
 	ih->type_of_service = 0;
 	ih->total_length = rte_cpu_to_be_16(sizeof(*ih) + sizeof(*ich));
 	ih->packet_id = 0;
-	ih->fragment_offset = RTE_BE16(RTE_IPV4_HDR_DF_FLAG);
+	ih->fragment_offset = RTE_BE16(DPG_IPV4_HDR_DF_FLAG);
 	ih->time_to_live = 64;
 	ih->next_proto_id = IPPROTO_ICMP;
 	ih->hdr_checksum = 0;
 	ih->src_addr = rte_cpu_to_be_32(job->src_ip_current);
 	ih->dst_addr = rte_cpu_to_be_32(job->dst_ip_current);
 
-	ich->icmp_type = RTE_IP_ICMP_ECHO_REQUEST;
+	ich->icmp_type = DPG_IP_ICMP_ECHO_REQUEST;
 	ich->icmp_code = 0;
 	ich->icmp_cksum = 0;
 
@@ -667,11 +697,11 @@ dpg_ip_input(struct dpg_job *job, struct rte_mbuf *m)
 	}
 
 	ich = (struct dpg_icmp_hdr *)((uint8_t *)ih + hl);
-	if (ich->icmp_type != RTE_IP_ICMP_ECHO_REQUEST) {
+	if (ich->icmp_type != DPG_IP_ICMP_ECHO_REQUEST) {
 		return -EINVAL;
 	}
 
-	ich->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
+	ich->icmp_type = DPG_IP_ICMP_ECHO_REPLY;
 	DPG_SWAP(ih->src_addr, ih->dst_addr);
 	DPG_SWAP(eh->src_addr, eh->dst_addr);
 
@@ -727,7 +757,7 @@ dpg_do_job(struct dpg_job *job)
 		}
 
 		switch (eh->ether_type) {
-		case RTE_BE16(RTE_ETHER_TYPE_IPV4):
+		case RTE_BE16(DPG_ETHER_TYPE_IPV4):
 			if (job->echo == 0) {
 				goto drop;
 			}
@@ -738,7 +768,7 @@ dpg_do_job(struct dpg_job *job)
 			}
 			break;
 		
-		case RTE_BE16(RTE_ETHER_TYPE_ARP):
+		case RTE_BE16(DPG_ETHER_TYPE_ARP):
 			rc = dpg_arp_input(job, m);
 			if (rc < 0) {
 				goto drop;
@@ -897,7 +927,7 @@ int
 main(int argc, char **argv)
 {
 	int i, j, rc, n_rxq, n_txq, n_mbufs, main_lcore, first_lcore;
-	char mac_addr_buf[RTE_ETHER_ADDR_FMT_SIZE];
+	char mac_addr_buf[DPG_ETHER_ADDR_FMT_SIZE];
 	const char *port_name;
 	struct rte_eth_dev_info dev_info;
 	struct rte_eth_rxconf rxq_conf;
@@ -973,13 +1003,13 @@ main(int argc, char **argv)
 					port_name, -rc, rte_strerror(-rc));
 		}
 
-		rc = rte_eth_macaddr_get(i, &port->mac_addr);
+		rc = dpg_eth_macaddr_get(i, &port->mac_addr);
 		if (rc < 0) {
 			dpg_die("rte_eth_macaddr_get('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
 		}
 
-		rte_ether_format_addr(mac_addr_buf, sizeof(mac_addr_buf), &port->mac_addr);
+		dpg_ether_format_addr(mac_addr_buf, sizeof(mac_addr_buf), &port->mac_addr);
 		printf("Port '%s': %s\n", port_name, mac_addr_buf);
 
 		n_mbufs += n_rxq * port->n_rxd;
@@ -1033,11 +1063,7 @@ main(int argc, char **argv)
 					port_name, -rc, rte_strerror(-rc));
 		}
 
-		rc = rte_eth_promiscuous_enable(i);
-		if (rc < 0) {
-			printf("rte_eth_promiscuous_enable('%s') failed (%d:%s)\n",
-					port_name, -rc, rte_strerror(-rc));
-		}
+		rte_eth_promiscuous_enable(i);
 
 		rc = rte_eth_dev_set_link_up(i);
 		if (rc < 0) {
