@@ -16,7 +16,7 @@
 #include <rte_pci.h>
 #include <rte_version.h>
 
-#define DPG_USE_HARDWARE_COUNTERS
+#define DPG_PKT_LEN_MIN 60
 
 #define DPG_ETHER_ADDR_FMT_SIZE 18
 
@@ -82,10 +82,6 @@ typedef struct rte_ether_addr dpg_ether_addr_t;
 // 22.11.0.99
 #define dpg_dev_name(dev) rte_dev_name(dev)
 #endif
-
-struct dpg_counter {
-	uint64_t per_lcore[RTE_MAX_LCORE];
-};
 
 struct dpg_ether_hdr {
 	dpg_ether_addr_t dst_addr;
@@ -168,6 +164,8 @@ struct dpg_job {
 	uint16_t icmp_id_start;
 	uint16_t icmp_id_end;
 
+	uint16_t pkt_len;
+
 	int n_tx_pkts;
 	struct rte_mbuf *tx_pkts[DPG_MAX_PKT_BURST];
 };
@@ -191,13 +189,8 @@ static uint64_t g_hz;
 static struct dpg_port g_ports[RTE_MAX_ETHPORTS];
 static struct dpg_lcore g_lcores[RTE_MAX_LCORE];
 static struct rte_mempool *g_pktmbuf_pool;
-struct dpg_counter g_ipackets;
-struct dpg_counter g_opackets;
-static struct rte_eth_conf g_port_conf = {
-	.txmode = {
-		.mq_mode = DPG_ETH_MQ_TX_NONE,
-	},
-};
+static struct rte_eth_conf g_port_conf;
+static int g_bflag;
 
 #define DPG_SWAP(a, b) do { \
 	typeof(a) tmp = a; \
@@ -211,31 +204,6 @@ static struct rte_eth_conf g_port_conf = {
 
 #define dpg_die(...) \
 	rte_exit(EXIT_FAILURE, ##__VA_ARGS__);
-
-#ifdef DPG_USE_HARDWARE_COUNTERS
-#define dpg_counter_add(c, add)
-#define dpg_counter_get(c) 0
-#else
-static void
-dpg_counter_add(struct dpg_counter *c, uint64_t add)
-{
-	c->per_lcore[rte_lcore_id()] += add;
-}
-
-static uint64_t
-dpg_counter_get(struct dpg_counter *c)
-{
-	int i;
-	uint64_t sum;
-
-	sum = 0;
-	for (i = 0; i < DPG_ARRAY_SIZE(c->per_lcore); ++i) {
-		sum += c->per_lcore[i];
-	}
-
-	return sum;
-}
-#endif
 
 static int
 dpg_ether_unformat_addr(const char *s, dpg_ether_addr_t *a)
@@ -481,11 +449,18 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 
 	job = malloc(sizeof(*job));
 	memcpy(job, tmpl, sizeof(*job));
+	job->echo = 0;
+	job->request = 0;
+	job->queue_id = 0;
 
-	while ((opt = getopt(argc, argv, "hl:p:q:REB:A:s:d:i:")) != -1) {
+	while ((opt = getopt(argc, argv, "hbl:p:q:REB:A:s:d:i:L:")) != -1) {
 		switch (opt) {
 		case 'h':
 			dpg_print_usage();
+			break;
+
+		case 'b':
+			g_bflag = 1;
 			break;
 
 		case 'l':
@@ -564,6 +539,13 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			}
 			break;
 
+		case 'L':
+			job->pkt_len = strtoul(optarg, &endptr, 10);
+			if (*endptr != '\0' || job->pkt_len < DPG_PKT_LEN_MIN) {
+				dpg_invalid_argument(opt);
+			}
+			break;
+
 		default:
 			dpg_die("Unknown argument: '-%c'\n", opt);
 			break;
@@ -614,8 +596,8 @@ dpg_create_icmp_request(struct dpg_job *job)
 	}
 
 	m->next = NULL;
-	m->data_len = sizeof(*eh) + sizeof(*ih) + sizeof(*ich);
-	m->pkt_len = m->data_len;
+	m->pkt_len = DPG_MAX(sizeof(*eh) + sizeof(*ih) + sizeof(*ich), job->pkt_len);
+	m->data_len = m->pkt_len;
 
 	eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
 	ih = (struct dpg_ipv4_hdr *)(eh + 1);
@@ -627,7 +609,7 @@ dpg_create_icmp_request(struct dpg_job *job)
 	ih->version = 4;
 	ih->ihl = sizeof(*ih) / sizeof(uint32_t);
 	ih->type_of_service = 0;
-	ih->total_length = rte_cpu_to_be_16(sizeof(*ih) + sizeof(*ich));
+	ih->total_length = rte_cpu_to_be_16(m->pkt_len - sizeof(*eh));
 	ih->packet_id = 0;
 	ih->fragment_offset = RTE_BE16(DPG_IPV4_HDR_DF_FLAG);
 	ih->time_to_live = 64;
@@ -747,8 +729,6 @@ dpg_do_job(struct dpg_job *job)
 
 	n_rx = rte_eth_rx_burst(job->port_id, job->queue_id, rx_pkts, DPG_ARRAY_SIZE(rx_pkts));
 
-	dpg_counter_add(&g_ipackets, n_rx);
-
 	for (i = 0; i < n_rx; ++i) {
 		m = rx_pkts[i];
 		eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
@@ -817,8 +797,6 @@ drop:
 	memmove(job->tx_pkts, job->tx_pkts + txed,
 			(job->n_tx_pkts - txed) * sizeof (struct rte_mbuf *));
 	job->n_tx_pkts -= txed;
-
-	dpg_counter_add(&g_opackets, txed);
 }
 
 static void
@@ -827,15 +805,16 @@ dpg_set_microseconds(void)
 	g_microseconds = 1000000 * rte_rdtsc() / g_hz;
 }
 
-#ifdef DPG_USE_HARDWARE_COUNTERS
 static void
-dpg_get_stats(uint64_t *ipackets, uint64_t *opackets)
+dpg_get_stats(uint64_t *ipackets, uint64_t *ibytes, uint64_t *opackets, uint64_t *obytes)
 {
 	int port_id;
 	struct rte_eth_stats stats;
 
 	*ipackets = 0;
+	*ibytes = 0;
 	*opackets = 0;
+	*obytes = 0;
 
 	RTE_ETH_FOREACH_DEV(port_id) {
 		if (!dpg_port_is_configured(g_ports + port_id)) {
@@ -845,26 +824,20 @@ dpg_get_stats(uint64_t *ipackets, uint64_t *opackets)
 		rte_eth_stats_get(port_id, &stats);
 
 		*ipackets += stats.ipackets;
+		*ibytes += stats.ibytes;
 		*opackets += stats.opackets;
+		*obytes += stats.obytes;
 	}
 }
-#else // DPG_USE_HARDWARE_COUNTERS
-static void
-dpg_get_stats(uint64_t *ipackets, uint64_t *opackets)
-{
-	*ipackets = dpg_counter_get(&g_ipackets);
-	*opackets = dpg_counter_get(&g_opackets);
-}
-#endif // DPG_USE_HARDWARE_COUNTERS
 
 static int
 lcore_loop(void *dummy)
 {
 	int p, reports;
-	char ipps_b[40], opps_b[40];
+	char ipps_b[40], ibps_b[40], opps_b[40], obps_b[40];
 	uint64_t last_stats_time;
-	uint64_t ipackets[2], opackets[2];
-	uint64_t ipps, opps;
+	uint64_t ipackets[2], ibytes[2], opackets[2], obytes[2];
+	uint64_t ipps, ibps, opps, obps;
 	double dt;
 	struct dpg_lcore *lcore;
 	struct dpg_job *job;
@@ -883,7 +856,7 @@ lcore_loop(void *dummy)
 	if (lcore->is_first) {
 		reports = 0;
 		p = 0;
-		dpg_get_stats(&ipackets[p], &opackets[p]);
+		dpg_get_stats(&ipackets[p], &ibytes[p], &opackets[p], &obytes[p]);
 		p = 1 - p;
 	}
 
@@ -901,20 +874,43 @@ lcore_loop(void *dummy)
 		if (lcore->is_first && g_microseconds - last_stats_time >= 1000000) {
 			dt = g_microseconds - last_stats_time;
 			last_stats_time = g_microseconds;
-			dpg_get_stats(&ipackets[p], &opackets[p]);
+			dpg_get_stats(&ipackets[p], &ibytes[p], &opackets[p], &obytes[p]);
 			ipps = (ipackets[p] - ipackets[1 - p]) / dt * 1000000;
+			ibps = (ibytes[p] - ibytes[1 - p]) / dt * 1000000;
 			opps = (opackets[p] - opackets[1 - p]) / dt * 1000000;
+			obps = (obytes[p] - obytes[1 - p]) / dt * 1000000;
+
 			p = 1 - p;
 
 			if (reports == 20) {
 				reports = 0;
 			}
 			if (reports == 0) {
-				printf("%-12s%-12s\n", "ipps", "opps");
+				printf("%-12s", "ipps");
+				if (g_bflag) {
+					printf("%-12s", "ibps");
+				}
+				printf("%-12s", "opps");
+				if (g_bflag) {
+					printf("%-12s", "obps");
+				}
+				printf("\n");
 			}
 			dpg_norm(ipps_b, ipps, 1);
+			dpg_norm(ibps_b, ibps, 1);
 			dpg_norm(opps_b, opps, 1);
-			printf("%-12s%-12s\n", ipps_b, opps_b);
+			dpg_norm(obps_b, obps, 1);
+
+			printf("%-12s", ipps_b);
+			if (g_bflag) {
+				printf("%-12s", ibps_b);
+			}
+			printf("%-12s", opps_b);
+			if (g_bflag) {
+				printf("%-12s", obps_b);
+			}
+			printf("\n");
+
 			reports++;
 		}
 	}
@@ -943,6 +939,8 @@ main(int argc, char **argv)
 	argc -= rc;
 	argv += rc;
 
+	g_port_conf.txmode.mq_mode = DPG_ETH_MQ_TX_NONE;
+
 	main_lcore = rte_lcore_id();
 	tmpl = &tmpl_instance;
 	memset(tmpl, 0, sizeof(*tmpl));
@@ -954,6 +952,7 @@ main(int argc, char **argv)
 	dpg_parse_ip_interval("1.1.1.1", &tmpl->src_ip_start, &tmpl->src_ip_end);
 	dpg_parse_ip_interval("2.2.2.2", &tmpl->dst_ip_start, &tmpl->dst_ip_end);
 	tmpl->icmp_id_start = tmpl->icmp_id_end = 1;
+	tmpl->pkt_len = DPG_PKT_LEN_MIN;
 
 	while (argc > 1) {
 		rc = dpg_parse_job(&job, tmpl, argc, argv);
