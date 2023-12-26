@@ -37,6 +37,8 @@
 #define DPG_MEMPOOL_CACHE_SIZE 128
 #define DPG_MAX_PKT_BURST 128
 
+#define DPG_RSS_KEY_SIZE 40
+
 #define DPG_PPSTR(x) DPG_PPXSTR(x)
 #define DPG_PPXSTR(x) #x
 
@@ -86,8 +88,8 @@ typedef struct rte_ether_addr dpg_ether_addr_t;
 struct dpg_ether_hdr {
 	dpg_ether_addr_t dst_addr;
 	dpg_ether_addr_t src_addr;
-	uint16_t ether_type;
-}  __attribute__((aligned(2)));
+	rte_be16_t ether_type;
+} __attribute__((aligned(2)));
 
 struct dpg_arp_hdr {
 	rte_be16_t arp_hardware;
@@ -99,7 +101,7 @@ struct dpg_arp_hdr {
 	rte_be32_t arp_sip;
 	dpg_ether_addr_t arp_tha;
 	rte_be32_t arp_tip;
-} __attribute__((aligned(2)));
+} __attribute__((packed)) __attribute__((aligned(2))) ;
 
 struct dpg_ipv4_hdr {
         union {
@@ -123,7 +125,7 @@ struct dpg_ipv4_hdr {
 	rte_be16_t hdr_checksum;
 	rte_be32_t src_addr;
 	rte_be32_t dst_addr;
-} __attribute__((aligned(2)));
+} __attribute__((packed)) __attribute__((aligned(2)));
 
 struct dpg_icmp_hdr {
 	uint8_t  icmp_type;
@@ -131,7 +133,7 @@ struct dpg_icmp_hdr {
 	rte_be16_t icmp_cksum;
 	rte_be16_t icmp_ident;
 	rte_be16_t icmp_seq_nb;
-} __attribute__((aligned(2)));
+}  __attribute__((packed)) __attribute__((aligned(2)));
 
 struct dpg_job {
 	struct dpg_job *lcore_next;
@@ -177,6 +179,7 @@ struct dpg_port {
 	dpg_ether_addr_t mac_addr;
 	struct dpg_job *jobs;
 	struct rte_eth_conf conf;
+	uint8_t rss_key[DPG_RSS_KEY_SIZE];
 };
 
 struct dpg_lcore {
@@ -340,6 +343,50 @@ dpg_cksum(void *data, int len)
 	return reduced;
 }
 
+static uint32_t
+dpg_toeplitz_hash(const uint8_t *data, int cnt, const uint8_t *key)
+{   
+	uint32_t h, v;
+	int i, b;
+
+	h = 0; 
+	v = (key[0] << 24) + (key[1] << 16) + (key[2] << 8) + key[3];
+	for (i = 0; i < cnt; i++) {
+		for (b = 0; b < 8; ++b) {
+			if (data[i] & (1 << (7 - b))) {
+				h ^= v;
+			}
+			v <<= 1;
+			if ((i + 4) < DPG_RSS_KEY_SIZE &&
+			    (key[i + 4] & (1 << (7 - b)))) {
+				v |= 1;
+			}
+		}
+	}
+
+	return h;
+}
+
+uint32_t
+dpg_rss_icmp(rte_be32_t laddr, rte_be32_t faddr, const uint8_t *key)
+{
+	int off;
+	uint32_t h;
+	u_char data[8];
+
+	off = 0;
+
+	*(rte_be32_t *)(data + off) = faddr;
+	off += 4;
+
+	*(rte_be32_t *)(data + off) = laddr;
+	off += 4;
+
+	h = dpg_toeplitz_hash(data, off, key);
+	h &= 0x0000007F;
+	return h;
+}
+
 static void
 dpg_norm2(char *buf, double val, char *fmt, int normalize)
 {
@@ -439,7 +486,7 @@ dpg_parse_icmp_id_interval(char *str, uint16_t *id_start, uint16_t *id_end)
 static int
 dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv)
 {
-	int rc, opt; 
+	int rc, opt, echo, request, queue_id;
 	uint16_t port_id;
 	char *endptr;
 	char port_name[RTE_ETH_NAME_MAX_LEN];
@@ -449,9 +496,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 
 	job = malloc(sizeof(*job));
 	memcpy(job, tmpl, sizeof(*job));
-	job->echo = 0;
-	job->request = 0;
-	job->queue_id = 0;
+	echo = request = queue_id = -1;
 
 	while ((opt = getopt(argc, argv, "hbl:p:q:REB:A:s:d:i:L:")) != -1) {
 		switch (opt) {
@@ -489,18 +534,18 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			break;
 
 		case 'q':
-			job->queue_id = strtoul(optarg, &endptr, 10);
+			queue_id = strtoul(optarg, &endptr, 10);
 			if (*endptr != '\0') {
 				dpg_invalid_argument(opt);
 			}
 			break;
 
 		case 'R':
-			job->request = 1;
+			request = 1;
 			break;
 
 		case 'E':
-			job->echo = 1;
+			echo = 1;
 			break;
 
 		case 'B':
@@ -552,10 +597,39 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 		}
 	}
 
+	if (optind < argc && strcmp(argv[optind - 1], "--")) {
+		dpg_die("Unknown input: '%s'\n", argv[optind]);
+	}
+
 	lcore = g_lcores + job->lcore_id;
 	tmp = lcore->jobs;
 	lcore->jobs = job;
 	job->lcore_next = tmp;
+
+	if (job->port_id == tmpl->port_id) {
+		if (request < 0) {
+			request = tmpl->request;
+		}
+		if (echo < 0) {
+			echo = tmpl->echo;
+		}
+		if (queue_id < 0) {
+			queue_id = tmpl->queue_id;
+		}
+	} else {
+		if (request < 0) {
+			request = 0;
+		}
+		if (echo < 0) {
+			echo = 0;
+		}
+		if (queue_id < 0) {
+			queue_id = 0;
+		}
+	}
+	job->request = request;
+	job->echo = echo;
+	job->queue_id = queue_id;
 
 	port = g_ports + job->port_id;
 	for (tmp = port->jobs; tmp != NULL; tmp = tmp->port_next) {
@@ -611,7 +685,7 @@ dpg_create_icmp_request(struct dpg_job *job)
 	ih->type_of_service = 0;
 	ih->total_length = rte_cpu_to_be_16(m->pkt_len - sizeof(*eh));
 	ih->packet_id = 0;
-	ih->fragment_offset = RTE_BE16(DPG_IPV4_HDR_DF_FLAG);
+	ih->fragment_offset = 0;
 	ih->time_to_live = 64;
 	ih->next_proto_id = IPPROTO_ICMP;
 	ih->hdr_checksum = 0;
@@ -652,6 +726,25 @@ dpg_create_icmp_request(struct dpg_job *job)
 	return m;
 }
 
+static void
+dpg_check_rss_icmp_alg(struct dpg_job *job, rte_be32_t laddr, rte_be32_t faddr)
+{
+	uint32_t hash, queue_id;
+	struct dpg_port *port;
+
+	port = g_ports + job->port_id;
+	if (port->n_queues < 2) {
+		return;
+	}
+
+	hash = dpg_rss_icmp(laddr, faddr, port->rss_key);
+	queue_id = hash % port->n_queues;
+
+	if (queue_id != job->queue_id) {
+		dpg_die("Invalid ICMP rss algorithm\n");
+	}
+}
+
 static int
 dpg_ip_input(struct dpg_job *job, struct rte_mbuf *m)
 {
@@ -681,6 +774,10 @@ dpg_ip_input(struct dpg_job *job, struct rte_mbuf *m)
 	ich = (struct dpg_icmp_hdr *)((uint8_t *)ih + hl);
 	if (ich->icmp_type != DPG_IP_ICMP_ECHO_REQUEST) {
 		return -EINVAL;
+	}
+
+	if (0) {
+		dpg_check_rss_icmp_alg(job, ih->dst_addr, ih->src_addr);
 	}
 
 	ich->icmp_type = DPG_IP_ICMP_ECHO_REPLY;
@@ -837,7 +934,7 @@ lcore_loop(void *dummy)
 	char ipps_b[40], ibps_b[40], opps_b[40], obps_b[40];
 	uint64_t last_stats_time;
 	uint64_t ipackets[2], ibytes[2], opackets[2], obytes[2];
-	uint64_t ipps, ibps, opps, obps;
+	double ipps, ibps, opps, obps;
 	double dt;
 	struct dpg_lcore *lcore;
 	struct dpg_job *job;
@@ -875,10 +972,29 @@ lcore_loop(void *dummy)
 			dt = g_microseconds - last_stats_time;
 			last_stats_time = g_microseconds;
 			dpg_get_stats(&ipackets[p], &ibytes[p], &opackets[p], &obytes[p]);
-			ipps = (ipackets[p] - ipackets[1 - p]) / dt * 1000000;
-			ibps = (ibytes[p] - ibytes[1 - p]) / dt * 1000000;
-			opps = (opackets[p] - opackets[1 - p]) / dt * 1000000;
-			obps = (obytes[p] - obytes[1 - p]) / dt * 1000000;
+			if (ipackets[p] < ipackets[1 - p]) {
+				ipps = 0;
+			} else {
+				ipps = (ipackets[p] - ipackets[1 - p]) / dt * 1000000;
+			}
+			if (ibytes[p] < ibytes[1 - p]) {
+				ibps = 0;
+			} else {
+				ibps = (ibytes[p] - ibytes[1 - p]) / dt * 1000000;
+			}
+			if (opackets[p] < opackets[1 - p]) {
+				opps = 0;
+			} else {
+				opps = (opackets[p] - opackets[1 - p]) / dt * 1000000;
+			}
+			if (obytes[p] < obytes[1 - p]) {
+				obps = 0;
+			} else {
+				obps = (obytes[p] - obytes[1 - p]) / dt * 1000000;
+			}
+
+//			printf("ipps=%f: %"PRIu64" - %"PRIu64" dt=%f\n",
+//					ipps, ipackets[p], ipackets[1 - p], dt);
 
 			p = 1 - p;
 
@@ -916,6 +1032,33 @@ lcore_loop(void *dummy)
 	}
 
 	return 0;
+}
+
+static void
+dpg_port_get_rss_key(struct dpg_port *port)
+{
+	int rc, port_id;
+	char port_name[RTE_ETH_NAME_MAX_LEN];
+	struct rte_eth_rss_conf rss_conf;
+	static uint8_t freebsd_rss_key[DPG_RSS_KEY_SIZE] = {
+		0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
+		0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
+		0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
+		0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
+		0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+	};
+
+	memset(&rss_conf, 0, sizeof(rss_conf));
+	rss_conf.rss_key = port->rss_key;
+
+	port_id = port - g_ports;
+	rc = rte_eth_dev_rss_hash_conf_get(port_id, &rss_conf);
+	if (rc == -ENOTSUP) {
+		memcpy(port->rss_key, freebsd_rss_key, sizeof(port->rss_key));
+	} else if (rc < 0) {
+		dpg_die("rte_eth_dev_rss_hash_conf_get('%s') failed (%d:%s)\n",
+				port_name, -rc, rte_strerror(-rc));
+	}
 }
 
 int
@@ -1079,6 +1222,10 @@ main(int argc, char **argv)
 		if (rc < 0) {
 			printf("rte_eth_dev_set_link_up('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
+		}
+
+		if (port->n_queues > 1) {
+			dpg_port_get_rss_key(port);
 		}
 	}
 
