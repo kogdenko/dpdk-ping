@@ -83,6 +83,10 @@ typedef struct rte_ether_addr dpg_ether_addr_t;
 #define dpg_dev_name(dev) rte_dev_name(dev)
 #endif
 
+struct dpg_counter {
+	uint64_t per_lcore[RTE_MAX_LCORE];
+};
+
 struct dpg_ether_hdr {
 	dpg_ether_addr_t dst_addr;
 	dpg_ether_addr_t src_addr;
@@ -166,6 +170,7 @@ struct dpg_job {
 
 	uint16_t pkt_len;
 
+	int tx_bytes;
 	int n_tx_pkts;
 	struct rte_mbuf *tx_pkts[DPG_MAX_PKT_BURST];
 };
@@ -191,6 +196,11 @@ static struct dpg_lcore g_lcores[RTE_MAX_LCORE];
 static struct rte_mempool *g_pktmbuf_pool;
 static struct rte_eth_conf g_port_conf;
 static int g_bflag;
+static int g_Hflag;
+struct dpg_counter g_ipackets;
+struct dpg_counter g_opackets;
+struct dpg_counter g_ibytes;
+struct dpg_counter g_obytes;
 
 #define DPG_SWAP(a, b) do { \
 	typeof(a) tmp = a; \
@@ -204,6 +214,26 @@ static int g_bflag;
 
 #define dpg_die(...) \
 	rte_exit(EXIT_FAILURE, ##__VA_ARGS__);
+
+static void
+dpg_counter_add(struct dpg_counter *c, uint64_t add)
+{
+	c->per_lcore[rte_lcore_id()] += add;
+}
+
+static uint64_t
+dpg_counter_get(struct dpg_counter *c)
+{
+	int i;
+	uint64_t sum;
+
+	sum = 0;
+	for (i = 0; i < DPG_ARRAY_SIZE(c->per_lcore); ++i) {
+		sum += c->per_lcore[i];
+	}
+
+	return sum;
+}
 
 static int
 dpg_ether_unformat_addr(const char *s, dpg_ether_addr_t *a)
@@ -249,6 +279,7 @@ dpg_print_usage()
 	"\n"
 	"Job:\n"
 	"\t-h:  Print this help\n"
+	"\t-b:  Print bits/sec in report\n"
 	"\t-l {lcore id}:  Lcore to run on\n"
 	"\t-p {port name}:  Port to run on\n"
 	"\t-q {queue id}:  RSS queue id to run on\n"
@@ -259,6 +290,7 @@ dpg_print_usage()
 	"\t-s {ip[-ip]}:  Source ip addresses interval\n"
 	"\t-d {ip[-ip]}:  Destination ip addresses interval\n"
 	"\t-i {icmp id[-icmp id]}:  ICMP request id interval\n"
+	"\t-L { bytes }:  Packet size\n"
 	"Ports:\n"
 	);
 
@@ -453,7 +485,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 	job->request = 0;
 	job->queue_id = 0;
 
-	while ((opt = getopt(argc, argv, "hbl:p:q:REB:A:s:d:i:L:")) != -1) {
+	while ((opt = getopt(argc, argv, "hbl:p:q:REB:A:s:d:i:L:H")) != -1) {
 		switch (opt) {
 		case 'h':
 			dpg_print_usage();
@@ -544,6 +576,10 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			if (*endptr != '\0' || job->pkt_len < DPG_PKT_LEN_MIN) {
 				dpg_invalid_argument(opt);
 			}
+			break;
+
+		case 'H':
+			g_Hflag = 1;
 			break;
 
 		default:
@@ -720,18 +756,27 @@ dpg_arp_input(struct dpg_job *job, struct rte_mbuf *m)
 }
 
 static void
+dpg_add_tx(struct dpg_job *job, struct rte_mbuf *m)
+{
+	job->tx_bytes += m->pkt_len;
+	job->tx_pkts[job->n_tx_pkts++] = m;
+}
+
+static void
 dpg_do_job(struct dpg_job *job)
 {
-	int i, rc, n_rx, n_reqs, tx_burst, txed;
+	int i, rc, n_rx, n_reqs, tx_burst, txed, rx_bytes, tx_bytes;
 	uint64_t now, dt;
 	struct dpg_ether_hdr *eh;
 	struct rte_mbuf *m, *rx_pkts[DPG_MAX_PKT_BURST];
 
+	rx_bytes = 0;
 	n_rx = rte_eth_rx_burst(job->port_id, job->queue_id, rx_pkts, DPG_ARRAY_SIZE(rx_pkts));
 
 	for (i = 0; i < n_rx; ++i) {
 		m = rx_pkts[i];
 		eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
+		rx_bytes += m->data_len;
 		if (m->pkt_len < sizeof(*eh)) {
 			goto drop;
 		}
@@ -762,7 +807,7 @@ dpg_do_job(struct dpg_job *job)
 		dpg_set_ether_hdr_addresses(job, eh);
 
 		if (job->n_tx_pkts < DPG_ARRAY_SIZE(job->tx_pkts)) {
-			job->tx_pkts[job->n_tx_pkts++] = m;
+			dpg_add_tx(job, m);
 			continue;
 		}
 drop:
@@ -785,18 +830,34 @@ drop:
 		tx_burst = job->n_tx_pkts + n_reqs;
 
 		while (job->n_tx_pkts < tx_burst) {
-			job->tx_pkts[job->n_tx_pkts++] = dpg_create_icmp_request(job);
+			m = dpg_create_icmp_request(job);
+			dpg_add_tx(job, m);
 		}
 	}
 
-	if (!job->n_tx_pkts) {
-		return;
+	if (job->n_tx_pkts) {
+		txed = rte_eth_tx_burst(job->port_id, job->queue_id, job->tx_pkts, job->n_tx_pkts);
+		memmove(job->tx_pkts, job->tx_pkts + txed,
+				(job->n_tx_pkts - txed) * sizeof (struct rte_mbuf *));
+		job->n_tx_pkts -= txed;
+	} else {
+		txed = 0;
 	}
-	
-	txed = rte_eth_tx_burst(job->port_id, job->queue_id, job->tx_pkts, job->n_tx_pkts);
-	memmove(job->tx_pkts, job->tx_pkts + txed,
-			(job->n_tx_pkts - txed) * sizeof (struct rte_mbuf *));
-	job->n_tx_pkts -= txed;
+
+	if (!g_Hflag) {
+		tx_bytes = job->tx_bytes;
+		job->tx_bytes = 0;
+
+		for (i = 0; i < job->n_tx_pkts; ++i) {
+			job->tx_bytes += job->tx_pkts[i]->pkt_len;
+		}
+
+		dpg_counter_add(&g_ipackets, n_rx);
+		dpg_counter_add(&g_ibytes, rx_bytes);
+
+		dpg_counter_add(&g_opackets, txed);
+		dpg_counter_add(&g_obytes, tx_bytes - job->tx_bytes);
+	}
 }
 
 static void
@@ -816,17 +877,24 @@ dpg_get_stats(uint64_t *ipackets, uint64_t *ibytes, uint64_t *opackets, uint64_t
 	*opackets = 0;
 	*obytes = 0;
 
-	RTE_ETH_FOREACH_DEV(port_id) {
-		if (!dpg_port_is_configured(g_ports + port_id)) {
-			continue;
+	if (g_Hflag) {
+		RTE_ETH_FOREACH_DEV(port_id) {
+			if (!dpg_port_is_configured(g_ports + port_id)) {
+				continue;
+			}
+
+			rte_eth_stats_get(port_id, &stats);
+
+			*ipackets += stats.ipackets;
+			*ibytes += stats.ibytes;
+			*opackets += stats.opackets;
+			*obytes += stats.obytes;
 		}
-
-		rte_eth_stats_get(port_id, &stats);
-
-		*ipackets += stats.ipackets;
-		*ibytes += stats.ibytes;
-		*opackets += stats.opackets;
-		*obytes += stats.obytes;
+	} else {
+		*ipackets = dpg_counter_get(&g_ipackets);
+		*ibytes = dpg_counter_get(&g_ibytes);
+		*opackets = dpg_counter_get(&g_opackets);
+		*obytes = dpg_counter_get(&g_obytes);
 	}
 }
 
@@ -876,9 +944,9 @@ lcore_loop(void *dummy)
 			last_stats_time = g_microseconds;
 			dpg_get_stats(&ipackets[p], &ibytes[p], &opackets[p], &obytes[p]);
 			ipps = (ipackets[p] - ipackets[1 - p]) / dt * 1000000;
-			ibps = (ibytes[p] - ibytes[1 - p]) / dt * 1000000;
+			ibps = 8 * (ibytes[p] - ibytes[1 - p]) / dt * 1000000;
 			opps = (opackets[p] - opackets[1 - p]) / dt * 1000000;
-			obps = (obytes[p] - obytes[1 - p]) / dt * 1000000;
+			obps = 8 * (obytes[p] - obytes[1 - p]) / dt * 1000000;
 
 			p = 1 - p;
 
