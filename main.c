@@ -91,7 +91,7 @@ struct dpg_ether_hdr {
 	dpg_ether_addr_t dst_addr;
 	dpg_ether_addr_t src_addr;
 	uint16_t ether_type;
-}  __attribute__((aligned(2)));
+} __attribute__((packed)) __attribute__((aligned(2)));
 
 struct dpg_arp_hdr {
 	rte_be16_t arp_hardware;
@@ -103,7 +103,7 @@ struct dpg_arp_hdr {
 	rte_be32_t arp_sip;
 	dpg_ether_addr_t arp_tha;
 	rte_be32_t arp_tip;
-} __attribute__((aligned(2)));
+} __attribute__((packed)) __attribute__((aligned(2)));
 
 struct dpg_ipv4_hdr {
         union {
@@ -127,7 +127,7 @@ struct dpg_ipv4_hdr {
 	rte_be16_t hdr_checksum;
 	rte_be32_t src_addr;
 	rte_be32_t dst_addr;
-} __attribute__((aligned(2)));
+} __attribute__((packed)) __attribute__((aligned(2)));
 
 struct dpg_icmp_hdr {
 	uint8_t  icmp_type;
@@ -471,7 +471,7 @@ dpg_parse_icmp_id_interval(char *str, uint16_t *id_start, uint16_t *id_end)
 static int
 dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv)
 {
-	int rc, opt; 
+	int rc, opt, echo, request, queue_id; 
 	uint16_t port_id;
 	char *endptr;
 	char port_name[RTE_ETH_NAME_MAX_LEN];
@@ -481,9 +481,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 
 	job = malloc(sizeof(*job));
 	memcpy(job, tmpl, sizeof(*job));
-	job->echo = 0;
-	job->request = 0;
-	job->queue_id = 0;
+	echo = request = queue_id = -1;
 
 	while ((opt = getopt(argc, argv, "hbl:p:q:REB:A:s:d:i:L:H")) != -1) {
 		switch (opt) {
@@ -521,18 +519,18 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			break;
 
 		case 'q':
-			job->queue_id = strtoul(optarg, &endptr, 10);
+			queue_id = strtoul(optarg, &endptr, 10);
 			if (*endptr != '\0') {
 				dpg_invalid_argument(opt);
 			}
 			break;
 
 		case 'R':
-			job->request = 1;
+			request = 1;
 			break;
 
 		case 'E':
-			job->echo = 1;
+			echo = 1;
 			break;
 
 		case 'B':
@@ -588,10 +586,39 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 		}
 	}
 
+	if (optind < argc && strcmp(argv[optind - 1], "--")) {
+		dpg_die("Unknown input: '%s'\n", argv[optind]);
+	}
+
 	lcore = g_lcores + job->lcore_id;
 	tmp = lcore->jobs;
 	lcore->jobs = job;
 	job->lcore_next = tmp;
+
+	if (job->port_id == tmpl->port_id) {
+		if (request < 0) {
+			request = tmpl->request;
+		}
+		if (echo < 0) {
+			echo = tmpl->echo;
+		}
+		if (queue_id < 0) {
+			queue_id = tmpl->queue_id;
+		}
+	} else {
+		if (request < 0) {
+			request = 0;
+		}
+		if (echo < 0) {
+			echo = 0;
+		}
+		if (queue_id < 0) {
+			queue_id = 0;
+		}
+	}
+	job->request = request;
+	job->echo = echo;
+	job->queue_id = queue_id;
 
 	port = g_ports + job->port_id;
 	for (tmp = port->jobs; tmp != NULL; tmp = tmp->port_next) {
@@ -647,7 +674,7 @@ dpg_create_icmp_request(struct dpg_job *job)
 	ih->type_of_service = 0;
 	ih->total_length = rte_cpu_to_be_16(m->pkt_len - sizeof(*eh));
 	ih->packet_id = 0;
-	ih->fragment_offset = RTE_BE16(DPG_IPV4_HDR_DF_FLAG);
+	ih->fragment_offset = 0;
 	ih->time_to_live = 64;
 	ih->next_proto_id = IPPROTO_ICMP;
 	ih->hdr_checksum = 0;
