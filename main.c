@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <assert.h>
 #include <getopt.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <sys/socket.h>
@@ -36,6 +37,7 @@
 
 #define DPG_MEMPOOL_CACHE_SIZE 128
 #define DPG_MAX_PKT_BURST 128
+#define DPG_TXBUF_SIZE DPG_MAX_PKT_BURST
 
 #define DPG_PPSTR(x) DPG_PPXSTR(x)
 #define DPG_PPXSTR(x) #x
@@ -135,22 +137,22 @@ struct dpg_icmp_hdr {
 	rte_be16_t icmp_cksum;
 	rte_be16_t icmp_ident;
 	rte_be16_t icmp_seq_nb;
-} __attribute__((aligned(2)));
+} __attribute__((packed)) __attribute__((aligned(2)));
 
 struct dpg_job {
 	struct dpg_job *lcore_next;
 	struct dpg_job *port_next;
 
-	int request;
-	int echo;
+	int do_req;
+	int do_echo;
 
 	int port_id;
 	int queue_id;
 
 	int lcore_id;
 
-	uint64_t bandwidth;
-	uint64_t last_tx_time;
+	int req_rate;
+	uint64_t req_tx_time;
 
 	dpg_ether_addr_t dst_eth_addr;
 
@@ -172,7 +174,7 @@ struct dpg_job {
 
 	int tx_bytes;
 	int n_tx_pkts;
-	struct rte_mbuf *tx_pkts[DPG_MAX_PKT_BURST];
+	struct rte_mbuf *tx_pkts[DPG_TXBUF_SIZE];
 };
 
 struct dpg_port {
@@ -186,10 +188,10 @@ struct dpg_port {
 
 struct dpg_lcore {
 	struct dpg_job *jobs;
+	uint64_t tsc;
 	int is_first;
 };
 
-static volatile uint64_t g_microseconds;
 static uint64_t g_hz;
 static struct dpg_port g_ports[RTE_MAX_ETHPORTS];
 static struct dpg_lcore g_lcores[RTE_MAX_LCORE];
@@ -208,6 +210,7 @@ struct dpg_counter g_obytes;
 	b = tmp; \
 } while (0)
 
+#define DPG_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define DPG_MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #define DPG_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
@@ -379,13 +382,33 @@ dpg_norm2(char *buf, double val, char *fmt, int normalize)
 	int i;
 
 	if (normalize) {
-		for (i = 0; val >=1000 && i < sizeof(units)/sizeof(char *) - 1; i++) {
+		for (i = 0; val >=1000 && i < DPG_ARRAY_SIZE(units) - 1; i++) {
 			val /= 1000;
 		}
 	} else {
 		i = 0;
 	}
+
 	sprintf(buf, fmt, val, units[i]);
+}
+
+static int64_t
+dpg_unnorm(const char *s)
+{
+	double val;
+	char *endptr, *unit;
+	const char *units = "kmgt";
+
+	val = strtod(s, &endptr);
+	if (*endptr == '\0') {
+		return val;
+	} else {
+		unit = strchr(units, *endptr);
+		if (unit == NULL) {
+			return -EINVAL;
+		}
+		return val * pow(1000, (unit - units + 1));
+	}
 }
 
 static void
@@ -396,6 +419,12 @@ dpg_norm(char *buf, double val, int normalize)
 	} else {
 		dpg_norm2(buf, val, "%.0f%s", normalize);
 	}
+}
+
+static uint64_t
+dpg_rdtsc(void)
+{
+	return g_lcores[rte_lcore_id()].tsc;
 }
 
 static int
@@ -471,7 +500,8 @@ dpg_parse_icmp_id_interval(char *str, uint16_t *id_start, uint16_t *id_end)
 static int
 dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv)
 {
-	int rc, opt, echo, request, queue_id; 
+	int opt, do_echo, do_req, queue_id;
+	int64_t rc;
 	uint16_t port_id;
 	char *endptr;
 	char port_name[RTE_ETH_NAME_MAX_LEN];
@@ -481,7 +511,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 
 	job = malloc(sizeof(*job));
 	memcpy(job, tmpl, sizeof(*job));
-	echo = request = queue_id = -1;
+	do_echo = do_req = queue_id = -1;
 
 	while ((opt = getopt(argc, argv, "hbl:p:q:REB:A:s:d:i:L:H")) != -1) {
 		switch (opt) {
@@ -526,18 +556,19 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			break;
 
 		case 'R':
-			request = 1;
+			do_req = 1;
 			break;
 
 		case 'E':
-			echo = 1;
+			do_echo = 1;
 			break;
 
 		case 'B':
-			job->bandwidth = strtoull(optarg, &endptr, 10);
-			if (*endptr != '\0') {
+			rc = dpg_unnorm(optarg);
+			if (rc < 0) {
 				dpg_invalid_argument(opt);
 			}
+			job->req_rate = rc;
 			break;
 
 		case 'A':
@@ -596,28 +627,28 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 	job->lcore_next = tmp;
 
 	if (job->port_id == tmpl->port_id) {
-		if (request < 0) {
-			request = tmpl->request;
+		if (do_req < 0) {
+			do_req = tmpl->do_req;
 		}
-		if (echo < 0) {
-			echo = tmpl->echo;
+		if (do_echo < 0) {
+			do_echo = tmpl->do_echo;
 		}
 		if (queue_id < 0) {
 			queue_id = tmpl->queue_id;
 		}
 	} else {
-		if (request < 0) {
-			request = 0;
+		if (do_req < 0) {
+			do_req = 0;
 		}
-		if (echo < 0) {
-			echo = 0;
+		if (do_echo < 0) {
+			do_echo = 0;
 		}
 		if (queue_id < 0) {
 			queue_id = 0;
 		}
 	}
-	job->request = request;
-	job->echo = echo;
+	job->do_req = do_req;
+	job->do_echo = do_echo;
 	job->queue_id = queue_id;
 
 	port = g_ports + job->port_id;
@@ -789,15 +820,35 @@ dpg_add_tx(struct dpg_job *job, struct rte_mbuf *m)
 	job->tx_pkts[job->n_tx_pkts++] = m;
 }
 
+static int
+dpg_req_ratelimit(struct dpg_job *job, int rate)
+{
+	int n_reqs, room, dp;
+	uint64_t tsc, dt;
+
+	room = DPG_TXBUF_SIZE - job->n_tx_pkts;
+
+	tsc = dpg_rdtsc();
+	dt = tsc - job->req_tx_time;
+
+	dp = rate * dt / g_hz;
+
+	n_reqs = DPG_MIN(dp, room);
+
+	job->req_tx_time += n_reqs * g_hz / rate;
+
+	return n_reqs;
+}
+
 static void
 dpg_do_job(struct dpg_job *job)
 {
-	int i, rc, n_rx, n_reqs, tx_burst, txed, rx_bytes, tx_bytes;
-	uint64_t now, dt;
+	int i, rc, n_rx, n_reqs, n_rpls, room, txed, rx_bytes, tx_bytes;
 	struct dpg_ether_hdr *eh;
 	struct rte_mbuf *m, *rx_pkts[DPG_MAX_PKT_BURST];
 
 	rx_bytes = 0;
+	n_rpls = 0;
 	n_rx = rte_eth_rx_burst(job->port_id, job->queue_id, rx_pkts, DPG_ARRAY_SIZE(rx_pkts));
 
 	for (i = 0; i < n_rx; ++i) {
@@ -810,7 +861,7 @@ dpg_do_job(struct dpg_job *job)
 
 		switch (eh->ether_type) {
 		case RTE_BE16(DPG_ETHER_TYPE_IPV4):
-			if (job->echo == 0) {
+			if (job->do_echo == 0) {
 				goto drop;
 			}
 
@@ -818,6 +869,7 @@ dpg_do_job(struct dpg_job *job)
 			if (rc < 0) {
 				goto drop;
 			}
+			n_rpls++;
 			break;
 		
 		case RTE_BE16(DPG_ETHER_TYPE_ARP):
@@ -833,7 +885,7 @@ dpg_do_job(struct dpg_job *job)
 
 		dpg_set_ether_hdr_addresses(job, eh);
 
-		if (job->n_tx_pkts < DPG_ARRAY_SIZE(job->tx_pkts)) {
+		if (job->n_tx_pkts < DPG_TXBUF_SIZE) {
 			dpg_add_tx(job, m);
 			continue;
 		}
@@ -841,22 +893,15 @@ drop:
 		rte_pktmbuf_free(m);
 	}
 
-	if (job->request && job->n_tx_pkts < DPG_ARRAY_SIZE(job->tx_pkts)) {
-		now = g_microseconds;
-		dt = now - job->last_tx_time;
-		n_reqs = job->bandwidth * dt / 1000000;
-
-		if (n_reqs >= DPG_ARRAY_SIZE(job->tx_pkts) - job->n_tx_pkts) {
-			n_reqs = DPG_ARRAY_SIZE(job->tx_pkts) - job->n_tx_pkts;
-			job->last_tx_time = now;
-			
+	room = DPG_TXBUF_SIZE - job->n_tx_pkts;
+	if (job->do_req && room) {
+		if (job->req_rate) {
+			n_reqs = dpg_req_ratelimit(job, job->req_rate);
 		} else {
-			job->last_tx_time += n_reqs * 1000000 / job->bandwidth;
+			n_reqs = room;
 		}
 
-		tx_burst = job->n_tx_pkts + n_reqs;
-
-		while (job->n_tx_pkts < tx_burst) {
+		for (i = 0; i < n_reqs; ++i) {
 			m = dpg_create_icmp_request(job);
 			dpg_add_tx(job, m);
 		}
@@ -885,12 +930,6 @@ drop:
 		dpg_counter_add(&g_opackets, txed);
 		dpg_counter_add(&g_obytes, tx_bytes - job->tx_bytes);
 	}
-}
-
-static void
-dpg_set_microseconds(void)
-{
-	g_microseconds = 1000000 * rte_rdtsc() / g_hz;
 }
 
 static void
@@ -925,88 +964,88 @@ dpg_get_stats(uint64_t *ipackets, uint64_t *ibytes, uint64_t *opackets, uint64_t
 	}
 }
 
-static int
-lcore_loop(void *dummy)
+static void
+dpg_print_stat(uint64_t d_tsc)
 {
-	int p, reports;
-	char ipps_b[40], ibps_b[40], opps_b[40], obps_b[40];
-	uint64_t last_stats_time;
-	uint64_t ipackets[2], ibytes[2], opackets[2], obytes[2];
 	uint64_t ipps, ibps, opps, obps;
-	double dt;
+	char ipps_b[40], ibps_b[40], opps_b[40], obps_b[40];
+	static uint64_t ipackets[2], ibytes[2], opackets[2], obytes[2];
+	static int p, reports;
+
+	dpg_get_stats(&ipackets[p], &ibytes[p], &opackets[p], &obytes[p]);
+	ipps = (ipackets[p] - ipackets[1 - p]) * g_hz / d_tsc;
+	ibps = 8 * (ibytes[p] - ibytes[1 - p]) * g_hz / d_tsc;
+	opps = (opackets[p] - opackets[1 - p]) * g_hz / d_tsc;
+	obps = 8 * (obytes[p] - obytes[1 - p]) * g_hz / d_tsc;
+
+	p = 1 - p;
+
+	if (reports == 20) {
+		reports = 0;
+	}
+	if (reports == 0) {
+		printf("%-12s", "ipps");
+		if (g_bflag) {
+			printf("%-12s", "ibps");
+		}
+		printf("%-12s", "opps");
+		if (g_bflag) {
+			printf("%-12s", "obps");
+		}
+		printf("\n");
+	}
+	dpg_norm(ipps_b, ipps, 1);
+	dpg_norm(ibps_b, ibps, 1);
+	dpg_norm(opps_b, opps, 1);
+	dpg_norm(obps_b, obps, 1);
+
+	printf("%-12s", ipps_b);
+	if (g_bflag) {
+		printf("%-12s", ibps_b);
+	}
+	printf("%-12s", opps_b);
+	if (g_bflag) {
+		printf("%-12s", obps_b);
+	}
+	printf("\n");
+
+	reports++;
+}
+
+static int
+dpg_lcore_loop(void *dummy)
+{
+	uint64_t stat_time, tsc;
 	struct dpg_lcore *lcore;
 	struct dpg_job *job;
 
 	lcore = g_lcores + rte_lcore_id();
 
-	for (job = lcore->jobs; job != NULL; job = job->lcore_next) {
-		job->last_tx_time = g_microseconds;
+	tsc = rte_rdtsc();
+	stat_time = tsc;
 
+	for (job = lcore->jobs; job != NULL; job = job->lcore_next) {
 		job->icmp_seq_nb = DPG_ICMP_SEQ_NB_START;
 		job->src_ip_current = job->src_ip_start;
 		job->dst_ip_current = job->dst_ip_start;
 		job->icmp_id_current = job->icmp_id_start;
-	}
-	
-	if (lcore->is_first) {
-		reports = 0;
-		p = 0;
-		dpg_get_stats(&ipackets[p], &ibytes[p], &opackets[p], &obytes[p]);
-		p = 1 - p;
-	}
 
-	last_stats_time = g_microseconds;
+		job->req_tx_time = tsc;
+	}
 
 	for (;;) {
-		if (lcore->is_first) {
-			dpg_set_microseconds();
-		}
+		lcore->tsc = rte_rdtsc();
 
 		for (job = lcore->jobs; job != NULL; job = job->lcore_next) {
 			dpg_do_job(job);
 		}
 
-		if (lcore->is_first && g_microseconds - last_stats_time >= 1000000) {
-			dt = g_microseconds - last_stats_time;
-			last_stats_time = g_microseconds;
-			dpg_get_stats(&ipackets[p], &ibytes[p], &opackets[p], &obytes[p]);
-			ipps = (ipackets[p] - ipackets[1 - p]) / dt * 1000000;
-			ibps = 8 * (ibytes[p] - ibytes[1 - p]) / dt * 1000000;
-			opps = (opackets[p] - opackets[1 - p]) / dt * 1000000;
-			obps = 8 * (obytes[p] - obytes[1 - p]) / dt * 1000000;
-
-			p = 1 - p;
-
-			if (reports == 20) {
-				reports = 0;
+		if (lcore->is_first) {
+			tsc = lcore->tsc;
+			if (tsc - stat_time >= g_hz) {
+				dpg_print_stat(tsc - stat_time);
+				stat_time = tsc;
 			}
-			if (reports == 0) {
-				printf("%-12s", "ipps");
-				if (g_bflag) {
-					printf("%-12s", "ibps");
-				}
-				printf("%-12s", "opps");
-				if (g_bflag) {
-					printf("%-12s", "obps");
-				}
-				printf("\n");
-			}
-			dpg_norm(ipps_b, ipps, 1);
-			dpg_norm(ibps_b, ibps, 1);
-			dpg_norm(opps_b, opps, 1);
-			dpg_norm(obps_b, obps, 1);
-
-			printf("%-12s", ipps_b);
-			if (g_bflag) {
-				printf("%-12s", ibps_b);
-			}
-			printf("%-12s", opps_b);
-			if (g_bflag) {
-				printf("%-12s", obps_b);
-			}
-			printf("\n");
-
-			reports++;
 		}
 	}
 
@@ -1034,13 +1073,14 @@ main(int argc, char **argv)
 	argc -= rc;
 	argv += rc;
 
+	g_hz = rte_get_tsc_hz();
+
 	g_port_conf.txmode.mq_mode = DPG_ETH_MQ_TX_NONE;
 
 	main_lcore = rte_lcore_id();
 	tmpl = &tmpl_instance;
 	memset(tmpl, 0, sizeof(*tmpl));
 	tmpl->lcore_id = main_lcore;
-	tmpl->bandwidth = 100000000llu; // 100 mpps
 	for (i = 0; i < DPG_ARRAY_SIZE(tmpl->dst_eth_addr.addr_bytes); ++i) {
 		tmpl->dst_eth_addr.addr_bytes[i] = 0xFF;
 	}
@@ -1177,9 +1217,6 @@ main(int argc, char **argv)
 		}
 	}
 
-	g_hz = rte_get_tsc_hz();
-	dpg_set_microseconds();
-
 	first_lcore = -1;
 	RTE_LCORE_FOREACH(i) {
 		lcore = g_lcores + i;
@@ -1191,13 +1228,13 @@ main(int argc, char **argv)
 			lcore->is_first = 1;
 		}
 		if (i != main_lcore) {
-			rte_eal_remote_launch(lcore_loop, NULL, i);
+			rte_eal_remote_launch(dpg_lcore_loop, NULL, i);
 		}
 	}
 
 	lcore = g_lcores + main_lcore;
 	if (lcore->jobs != NULL) {
-		lcore_loop(NULL);
+		dpg_lcore_loop(NULL);
 	}
 
 	RTE_LCORE_FOREACH(i) {
