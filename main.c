@@ -275,7 +275,9 @@ dpg_invalid_argument(int arg)
 static void
 dpg_print_usage()
 {
-	int port_id;
+	int rc, port_id;
+	dpg_ether_addr_t mac_addr;
+	char mac_addr_buf[DPG_ETHER_ADDR_FMT_SIZE];
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 
 	printf("Usage: dpdk-ping [DPDK options] -- job [-- job [-- job ...]]\n"
@@ -299,7 +301,14 @@ dpg_print_usage()
 
 	RTE_ETH_FOREACH_DEV(port_id) {
 		rte_eth_dev_get_name_by_port(port_id, port_name);
-		printf("%s\n", port_name);
+		printf("%s", port_name);
+
+		rc = dpg_eth_macaddr_get(port_id, &mac_addr);
+		if (rc == 0) {
+			dpg_ether_format_addr(mac_addr_buf, sizeof(mac_addr_buf), &mac_addr);
+			printf("  %s", mac_addr_buf);
+		}
+		printf("\n");
 	}
 
 	rte_exit(EXIT_SUCCESS, "\n");
@@ -1056,7 +1065,6 @@ int
 main(int argc, char **argv)
 {
 	int i, rc, port_id, n_rxq, n_txq, n_mbufs, main_lcore, first_lcore;
-	char mac_addr_buf[DPG_ETHER_ADDR_FMT_SIZE];
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 	struct rte_eth_dev_info dev_info;
 	struct rte_eth_rxconf rxq_conf;
@@ -1147,9 +1155,6 @@ main(int argc, char **argv)
 			dpg_die("rte_eth_macaddr_get('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
 		}
-
-		dpg_ether_format_addr(mac_addr_buf, sizeof(mac_addr_buf), &port->mac_addr);
-		printf("Port '%s': %s\n", port_name, mac_addr_buf);
 
 		n_mbufs += n_rxq * port->n_rxd;
 		n_mbufs += n_txq * (port->n_txd + DPG_MAX_PKT_BURST);
