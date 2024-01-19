@@ -24,11 +24,11 @@
 #define DPG_IP_ICMP_ECHO_REPLY 0
 #define DPG_IP_ICMP_ECHO_REQUEST 8
 
-#define DPG_ICMP_SEQ_NB_START 1
-#define DPG_ICMP_SEQ_NB_END 50000
+#define DPG_IPPROTO_ICMPV6 56
 
 #define DPG_ETHER_TYPE_ARP 0x0806
 #define DPG_ETHER_TYPE_IPV4 0x0800
+#define DPG_ETHER_TYPE_IPV6 0x86DD
 
 #define DPG_IPV4_HDR_DF_FLAG (1 << 6)
 
@@ -132,11 +132,31 @@ struct dpg_ipv4_hdr {
 } __attribute__((packed)) __attribute__((aligned(2)));
 
 struct dpg_icmp_hdr {
-	uint8_t  icmp_type;
-	uint8_t  icmp_code;
+	uint8_t icmp_type;
+	uint8_t icmp_code;
 	rte_be16_t icmp_cksum;
 	rte_be16_t icmp_ident;
 	rte_be16_t icmp_seq_nb;
+} __attribute__((packed)) __attribute__((aligned(2)));
+
+struct dpg_ipv6_hdr {
+	rte_be32_t vtc_flow;
+	rte_be16_t payload_len;
+	uint8_t proto;
+	uint8_t hop_limits;
+	uint8_t src_addr[16];
+	uint8_t  dst_addr[16];
+} __attribute__((packed)) __attribute__((aligned(2)));
+
+struct dpg_srv6_hdr {
+	uint8_t next_header;
+	uint8_t hdr_ext_len;
+	uint8_t routing_type;
+	uint8_t segments_left;
+	uint8_t last_entry;
+	uint8_t flags;
+	rte_be16_t tag;
+	uint8_t localsid[16];
 } __attribute__((packed)) __attribute__((aligned(2)));
 
 struct dpg_job {
@@ -145,6 +165,8 @@ struct dpg_job {
 
 	int do_req;
 	int do_echo;
+
+	int verbose;
 
 	int port_id;
 	int queue_id;
@@ -155,8 +177,6 @@ struct dpg_job {
 	uint64_t req_tx_time;
 
 	dpg_ether_addr_t dst_eth_addr;
-
-	uint32_t icmp_seq_nb;
 
 	uint32_t src_ip_current;
 	uint32_t src_ip_start;
@@ -170,6 +190,14 @@ struct dpg_job {
 	uint16_t icmp_id_start;
 	uint16_t icmp_id_end;
 
+	uint16_t icmp_seq_current;
+	uint16_t icmp_seq_start;
+	uint16_t icmp_seq_end;
+
+	int tunnel;
+	uint8_t tunnel_src[16];
+	uint8_t tunnel_dst[16];
+	uint8_t srv6_localsid[16];
 	uint16_t pkt_len;
 
 	int tx_bytes;
@@ -239,6 +267,21 @@ dpg_counter_get(struct dpg_counter *c)
 }
 
 static int
+dpg_memcmpz(const void *ptr, size_t n)
+{
+	uint8_t rc;
+	size_t i;
+
+	for (i = 0; i < n; ++i) {
+		rc = ((const uint8_t *)ptr)[i];
+		if (rc) {
+			return rc;
+		}
+	}
+	return 0;
+}
+
+static int
 dpg_ether_unformat_addr(const char *s, dpg_ether_addr_t *a)
 {
 	int rc;
@@ -267,9 +310,23 @@ dpg_eth_macaddr_get(uint16_t port_id, dpg_ether_addr_t *mac_addr)
 }
 
 static void
-dpg_invalid_argument(int arg)
+dpg_invalid_argument(int short_name, const char *long_name)
 {
-	dpg_die("Invalid argument: '-%c'", arg);
+	if (long_name != NULL) {
+		dpg_die("Invalid argument: '--%s'", long_name);
+	} else {
+		dpg_die("Invalid argument: '-%c'", short_name);
+	}
+}
+
+static void
+dpg_argument_not_specified(int short_name, const char *long_name)
+{
+	if (long_name != NULL) {
+		dpg_die("Argument '--%s' not specified", long_name);
+	} else {
+		dpg_die("Argument '-%c' not specified", short_name);
+	}
 }
 
 static void
@@ -284,6 +341,8 @@ dpg_print_usage()
 	"\n"
 	"Job:\n"
 	"\t-h:  Print this help\n"
+	"\t-V:  Be verbose\n"
+	"\t-Q:  Be quiet\n"
 	"\t-b:  Print bits/sec in report\n"
 	"\t-l {lcore id}:  Lcore to run on\n"
 	"\t-p {port name}:  Port to run on\n"
@@ -294,8 +353,14 @@ dpg_print_usage()
 	"\t-A {ether address}:  Destination ethernet address\n"
 	"\t-s {ip[-ip]}:  Source ip addresses interval\n"
 	"\t-d {ip[-ip]}:  Destination ip addresses interval\n"
-	"\t-i {icmp id[-icmp id]}:  ICMP request id interval\n"
 	"\t-L { bytes }:  Packet size\n"
+	"\t-H:  Use hardware statistics\n"
+	"\t--icmp-id {id[-id]}:  ICMP request id interval\n"
+	"\t--icmp-seq {seq[-seq]}:  ICMP request sequence interval\n"
+	"\t--srv6-tunnel: Encapsulate packet to srv6\n"
+	"\t--tunnel-src {ipv6}:  Tunnel source address\n"
+	"\t--tunnel-dst {ipv6}:  Tunnel destination address\n"
+	"\t--srv6-localsid:  Localsid for srv6 tunnel\n"
 	"Ports:\n"
 	);
 
@@ -346,7 +411,7 @@ dpg_cksum_reduce(uint64_t sum)
 }
 
 static uint64_t
-dpg_cksum_raw(const u_char *b, int size)
+dpg_cksum_raw(const uint8_t *b, int size)
 {
 	uint64_t sum;
 
@@ -430,6 +495,43 @@ dpg_norm(char *buf, double val, int normalize)
 	}
 }
 
+static const char *
+dpg_icmp_type_string(int icmp_type)
+{
+	return icmp_type == DPG_IP_ICMP_ECHO_REQUEST ? "request" : "reply";
+}
+
+static void
+dpg_log_icmp(struct dpg_job *job, int tx, int tunnel,
+		struct dpg_ipv4_hdr *ih, struct dpg_icmp_hdr *ich)
+{
+	char port_name[RTE_ETH_NAME_MAX_LEN];
+	char sabuf[INET_ADDRSTRLEN];
+	char dabuf[INET_ADDRSTRLEN];
+
+	rte_eth_dev_get_name_by_port(job->port_id, port_name);
+	inet_ntop(AF_INET, &ih->src_addr, sabuf, sizeof(sabuf));
+	inet_ntop(AF_INET, &ih->dst_addr, dabuf, sizeof(dabuf));
+
+	printf("%s (txq=%d): %s %sicmp echo %s: %s->%s, id=%d, seq=%d\n",
+			port_name, job->queue_id,
+			tx ? "Sent" : "Recv",
+			tunnel ? "encap " : "",
+			dpg_icmp_type_string(ich->icmp_type),
+			sabuf, dabuf,
+			rte_be_to_cpu_16(ich->icmp_ident),
+			rte_be_to_cpu_16(ich->icmp_seq_nb));
+}
+
+static void
+dpg_log_custom(struct dpg_job *job, const char *proto)
+{
+	char port_name[RTE_ETH_NAME_MAX_LEN];
+
+	rte_eth_dev_get_name_by_port(job->port_id, port_name);
+	printf("%s (txq=%d): Recv %s packet\n", port_name, job->queue_id, proto);
+}
+
 static uint64_t
 dpg_rdtsc(void)
 {
@@ -477,7 +579,7 @@ dpg_parse_ip_interval(char *str, uint32_t *ip_start, uint32_t *ip_end)
 }
 
 static int
-dpg_parse_icmp_id_interval(char *str, uint16_t *id_start, uint16_t *id_end)
+dpg_parse_uint16_interval(char *str, uint16_t *id_start, uint16_t *id_end)
 {
 	unsigned long ul;
 	char *delim, *endptr;
@@ -509,23 +611,77 @@ dpg_parse_icmp_id_interval(char *str, uint16_t *id_start, uint16_t *id_end)
 static int
 dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv)
 {
-	int opt, do_echo, do_req, queue_id;
+	int opt, option_index, do_echo, do_req, queue_id;
 	int64_t rc;
 	uint16_t port_id;
 	char *endptr;
+	const char *optname;
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 	struct dpg_job *job, *tmp;
 	struct dpg_lcore *lcore;
 	struct dpg_port *port;
 
+	static struct option long_options[] = {
+		{ "help", no_argument, 0, 'h' },
+		{ "icmp-id", required_argument, 0, 0 },
+		{ "icmp-seq", required_argument, 0, 0 },
+		{ "no-tunnel", no_argument, 0, 0 },
+		{ "tunnel-src", required_argument, 0, 0 },
+		{ "tunnel-dst", required_argument, 0, 0 },
+		{ "srv6-tunnel", no_argument, 0, 0 },
+		{ "srv6-localsid", required_argument, 0, 0 },
+	};
+
 	job = malloc(sizeof(*job));
 	memcpy(job, tmpl, sizeof(*job));
 	do_echo = do_req = queue_id = -1;
 
-	while ((opt = getopt(argc, argv, "hbl:p:q:REB:A:s:d:i:L:H")) != -1) {
+	while ((opt = getopt_long(argc, argv, "hVQbl:p:q:REB:A:s:d:L:H",
+			long_options, &option_index)) != -1) {
 		switch (opt) {
+		case 0:
+			optname = long_options[option_index].name;
+			if (!strcmp(optname, "icmp-id")) {
+				rc = dpg_parse_uint16_interval(optarg, &job->icmp_id_start,
+						&job->icmp_id_end);
+				if (rc < 0) {
+					dpg_invalid_argument(0, optname);
+				}
+			} else if (!strcmp(optname, "icmp-seq")) {
+				rc = dpg_parse_uint16_interval(optarg, &job->icmp_seq_start,
+						&job->icmp_seq_end);
+				if (rc < 0) {
+					dpg_invalid_argument(0, optname);
+				}
+			} else if (!strcmp(optname, "no-tunnel")) {
+				job->tunnel = 0;
+			} else if (!strcmp(optname, "tunnel-src")) {
+				if (inet_pton(AF_INET6, optarg, job->tunnel_src) != 1) {
+					dpg_invalid_argument(0, optname);
+				}
+			} else if (!strcmp(optname, "tunnel-dst")) {
+				if (inet_pton(AF_INET6, optarg, job->tunnel_dst) != 1) {
+					dpg_invalid_argument(0, optname);
+				}
+			} else if (!strcmp(optname, "srv6-tunnel")) {
+				job->tunnel = 1;
+			} else if (!strcmp(optname, "srv6-localsid")) {
+				if (inet_pton(AF_INET6, optarg, job->srv6_localsid) != 1) {
+					dpg_invalid_argument(0, optname);
+				}
+			}
+			break;
+
 		case 'h':
 			dpg_print_usage();
+			break;
+
+		case 'V':
+			job->verbose = 1;
+			break;
+
+		case 'Q':
+			job->verbose = 0;
 			break;
 
 		case 'b':
@@ -535,7 +691,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 		case 'l':
 			job->lcore_id = strtoul(optarg, &endptr, 10);
 			if (*endptr != '\0') {
-				dpg_invalid_argument(opt);
+				dpg_invalid_argument(opt, NULL);
 			}
 			rc = rte_lcore_is_enabled(job->lcore_id);
 			if (!rc) {
@@ -560,7 +716,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 		case 'q':
 			queue_id = strtoul(optarg, &endptr, 10);
 			if (*endptr != '\0') {
-				dpg_invalid_argument(opt);
+				dpg_invalid_argument(opt, NULL);
 			}
 			break;
 
@@ -575,7 +731,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 		case 'B':
 			rc = dpg_unnorm(optarg);
 			if (rc < 0) {
-				dpg_invalid_argument(opt);
+				dpg_invalid_argument(opt, NULL);
 			}
 			job->req_rate = rc;
 			break;
@@ -583,36 +739,28 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 		case 'A':
 			rc = dpg_ether_unformat_addr(optarg, &job->dst_eth_addr);
 			if (rc != 0) {
-				dpg_invalid_argument(opt);
+				dpg_invalid_argument(opt, NULL);
 			}
 			break;
 
 		case 's':
 			rc = dpg_parse_ip_interval(optarg, &job->src_ip_start, &job->src_ip_end);
 			if (rc < 0) {
-				dpg_invalid_argument(opt);
+				dpg_invalid_argument(opt, NULL);
 			}
 			break;
 
 		case 'd':
 			rc = dpg_parse_ip_interval(optarg, &job->dst_ip_start, &job->dst_ip_end);
 			if (rc < 0) {
-				dpg_invalid_argument(opt);
-			}
-			break;
-
-		case 'i':
-			rc = dpg_parse_icmp_id_interval(optarg, &job->icmp_id_start,
-					&job->icmp_id_end);
-			if (rc < 0) {
-				dpg_invalid_argument(opt);
+				dpg_invalid_argument(opt, NULL);
 			}
 			break;
 
 		case 'L':
 			job->pkt_len = strtoul(optarg, &endptr, 10);
 			if (*endptr != '\0' || job->pkt_len < DPG_PKT_LEN_MIN) {
-				dpg_invalid_argument(opt);
+				dpg_invalid_argument(opt, NULL);
 			}
 			break;
 
@@ -660,6 +808,18 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 	job->do_echo = do_echo;
 	job->queue_id = queue_id;
 
+	if (job->tunnel) {
+		if (!dpg_memcmpz(job->tunnel_src, sizeof(job->tunnel_src))) {
+			dpg_argument_not_specified(0, "tunnel-src");
+		}
+		if (!dpg_memcmpz(job->tunnel_dst, sizeof(job->tunnel_src))) {
+			dpg_argument_not_specified(0, "tunnel-dst");
+		}
+		if (!dpg_memcmpz(job->srv6_localsid, sizeof(job->srv6_localsid))) {
+			dpg_argument_not_specified(0, "srv6-localsid");
+		}
+	}
+
 	port = g_ports + job->port_id;
 	for (tmp = port->jobs; tmp != NULL; tmp = tmp->port_next) {
 		if (job->queue_id == tmp->queue_id) {
@@ -688,31 +848,68 @@ dpg_set_ether_hdr_addresses(struct dpg_job *job, struct dpg_ether_hdr *eh)
 static struct rte_mbuf *
 dpg_create_icmp_request(struct dpg_job *job)
 {
+	int ih_total_length, pkt_len;
 	struct rte_mbuf *m;
 	struct dpg_ether_hdr *eh;
 	struct dpg_ipv4_hdr *ih;
+	struct dpg_ipv6_hdr *ih6;
 	struct dpg_icmp_hdr *ich;
+	struct dpg_srv6_hdr *srh;
 
 	m = rte_pktmbuf_alloc(g_pktmbuf_pool);
 	if (m == NULL) {
 		dpg_die("rte_pktmbuf_alloc() failed\n");
 	}
 
+	eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
+
+	pkt_len = sizeof(*eh) + sizeof(*ih) + sizeof(*ich);
+
+	if (job->tunnel) {
+		pkt_len += sizeof(*ih6) + sizeof(*srh);
+
+		m->pkt_len = DPG_MAX(job->pkt_len, pkt_len);
+		ih_total_length = m->pkt_len - (sizeof(*eh) + sizeof(*ih6) + sizeof(*srh));
+
+		eh->ether_type = RTE_BE16(DPG_ETHER_TYPE_IPV6);
+		ih6 = (struct dpg_ipv6_hdr *)(eh + 1);
+		srh = (struct dpg_srv6_hdr *)(ih6 + 1);
+		ih = (struct dpg_ipv4_hdr *)(srh + 1);
+
+		ih6->vtc_flow = rte_cpu_to_be_32(0x60000000);
+		ih6->payload_len = rte_cpu_to_be_16(m->pkt_len - (sizeof(*eh) + sizeof(*ih6)));
+		ih6->proto = IPPROTO_ROUTING;
+		ih6->hop_limits = 64;
+		memcpy(ih6->src_addr, job->tunnel_src, sizeof(ih6->src_addr));
+		memcpy(ih6->dst_addr, job->tunnel_dst, sizeof(ih6->dst_addr));
+
+		srh->next_header = IPPROTO_IPIP;
+		srh->hdr_ext_len = sizeof(*srh) / 8 - 1;
+		srh->routing_type = 4; // Segment Routing v6
+		srh->segments_left = 0;
+		srh->last_entry = 0;
+		srh->flags = 0;
+		srh->tag = 0;
+		memcpy(srh->localsid, job->srv6_localsid, sizeof(srh->localsid));
+	} else {
+		m->pkt_len = DPG_MAX(job->pkt_len, pkt_len);
+		ih_total_length = m->pkt_len - sizeof(*eh);
+
+		eh->ether_type = RTE_BE16(DPG_ETHER_TYPE_IPV4);
+		ih = (struct dpg_ipv4_hdr *)(eh + 1);
+	}
+
 	m->next = NULL;
-	m->pkt_len = DPG_MAX(sizeof(*eh) + sizeof(*ih) + sizeof(*ich), job->pkt_len);
 	m->data_len = m->pkt_len;
 
-	eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
-	ih = (struct dpg_ipv4_hdr *)(eh + 1);
 	ich = (struct dpg_icmp_hdr *)(ih + 1);
 
-	eh->ether_type = RTE_BE16(DPG_ETHER_TYPE_IPV4);
 	dpg_set_ether_hdr_addresses(job, eh);
 
 	ih->version = 4;
 	ih->ihl = sizeof(*ih) / sizeof(uint32_t);
 	ih->type_of_service = 0;
-	ih->total_length = rte_cpu_to_be_16(m->pkt_len - sizeof(*eh));
+	ih->total_length = rte_cpu_to_be_16(ih_total_length);
 	ih->packet_id = 0;
 	ih->fragment_offset = 0;
 	ih->time_to_live = 64;
@@ -726,10 +923,13 @@ dpg_create_icmp_request(struct dpg_job *job)
 	ich->icmp_cksum = 0;
 
 	ich->icmp_ident = rte_cpu_to_be_16(job->icmp_id_current);
-	ich->icmp_seq_nb = rte_cpu_to_be_16(job->icmp_seq_nb);
+	ich->icmp_seq_nb = rte_cpu_to_be_16(job->icmp_seq_current);
 
 	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
 	ich->icmp_cksum = dpg_cksum(ich, sizeof(*ich));
+
+	m->pkt_len = DPG_MAX(pkt_len, job->pkt_len);
+	m->data_len = m->pkt_len;
 
 	if (job->icmp_id_current < job->icmp_id_end) {
 		job->icmp_id_current++;
@@ -743,29 +943,31 @@ dpg_create_icmp_request(struct dpg_job *job)
 				job->dst_ip_current++;
 			} else {
 				job->dst_ip_current = job->dst_ip_start;
-				if (job->icmp_seq_nb < DPG_ICMP_SEQ_NB_END) {
-					job->icmp_seq_nb++;
+				if (job->icmp_seq_current < job->icmp_seq_end) {
+					job->icmp_seq_current++;
 				} else {
-					job->icmp_seq_nb = DPG_ICMP_SEQ_NB_START;
+					job->icmp_seq_current = job->icmp_seq_start;
 				}
 			}
 		}
+	}
+
+	if (job->verbose) {
+		dpg_log_icmp(job, 1, job->tunnel, ih, ich);
 	}
 
 	return m;
 }
 
 static int
-dpg_ip_input(struct dpg_job *job, struct rte_mbuf *m)
+dpg_ip_input(struct dpg_job *job, int tunnel, void *ptr, int len)
 {
 	int hl;
-	struct dpg_ether_hdr *eh;
 	struct dpg_ipv4_hdr *ih;
 	struct dpg_icmp_hdr *ich;
 
-	eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
-	ih = (struct dpg_ipv4_hdr *)(eh + 1);
-	if (m->pkt_len < sizeof(*eh) + sizeof(*ih)) {
+	ih = ptr;
+	if (len < sizeof(*ih)) {
 		return -EINVAL;
 	}
 
@@ -773,7 +975,8 @@ dpg_ip_input(struct dpg_job *job, struct rte_mbuf *m)
 	if (hl < sizeof(*ih)) {
 		return -EINVAL;
 	}
-	if (m->pkt_len < sizeof(*eh) + hl) {
+
+	if (len < hl) {
 		return -EINVAL;
 	}
 
@@ -781,21 +984,107 @@ dpg_ip_input(struct dpg_job *job, struct rte_mbuf *m)
 		return -EINVAL;
 	}
 
+	if (len < hl + sizeof(*ich)) {
+		return -EINVAL;
+	}
 	ich = (struct dpg_icmp_hdr *)((uint8_t *)ih + hl);
 	if (ich->icmp_type != DPG_IP_ICMP_ECHO_REQUEST) {
 		return -EINVAL;
 	}
 
+	if (job->verbose) {
+		dpg_log_icmp(job, 0, tunnel, ih, ich);
+	}
+
+	if (!job->do_echo) {
+		return -ENOTSUP;
+	}
+
 	ich->icmp_type = DPG_IP_ICMP_ECHO_REPLY;
 	DPG_SWAP(ih->src_addr, ih->dst_addr);
-	DPG_SWAP(eh->src_addr, eh->dst_addr);
 
 	ich->icmp_cksum = 0;
 	ich->icmp_cksum = dpg_cksum(ich, sizeof(*ich));
 	ih->hdr_checksum = 0;
 	ih->hdr_checksum = dpg_cksum(ih, hl);
 
+	if (job->verbose) {
+		dpg_log_icmp(job, 1, tunnel, ih, ich);
+	}
+
 	return 0;
+}
+
+static void
+dpg_ipv6_input(struct dpg_job *job, struct rte_mbuf *m)
+{
+	int rc, hl, len, proto;
+	uint8_t *ptr;
+	char name[64];
+	struct dpg_ether_hdr *eh;
+	struct dpg_ipv6_hdr *ih;
+	struct dpg_srv6_hdr *srh;
+
+	eh = rte_pktmbuf_mtod(m, struct dpg_ether_hdr *);
+	ih = (struct dpg_ipv6_hdr *)(eh + 1);
+
+	if (m->pkt_len < sizeof(*eh) + sizeof(*ih)) {
+		goto malformed;
+	}
+
+	len = rte_be_to_cpu_16(ih->payload_len);
+	if (m->pkt_len < sizeof(*eh) + sizeof(*ih) + len) {
+		goto malformed;
+	}
+
+	ptr = (uint8_t *)(ih + 1);
+	proto = ih->proto;
+
+	while (1) {
+		switch (proto) {
+		case IPPROTO_ROUTING:
+			if (len < sizeof(*srh)) {
+				goto out;
+			}
+			srh = (struct dpg_srv6_hdr *)ptr;
+			hl = 8 * (srh->hdr_ext_len + 1);
+			if (len < hl) {
+				goto out;
+			}
+
+			len -= hl;
+			ptr += hl;
+
+			proto = srh->next_header;
+			break;
+
+		case DPG_IPPROTO_ICMPV6:
+			// TODO: NDP
+			goto out;	
+
+		case IPPROTO_IPIP:
+			rc = dpg_ip_input(job, 1, ptr, len);
+			if (rc == -EINVAL) {
+				goto out;
+			}
+			return;
+
+		default:
+			goto out;
+		}
+	}
+
+out:
+	if (job->verbose) {
+		snprintf(name, sizeof(name), "IPv6 (proto=%d)", proto);
+		dpg_log_custom(job, name);
+	}
+	return;
+
+malformed:
+	if (job->verbose) {
+		dpg_log_custom(job, "Malformed IPv6");
+	}
 }
 
 static int
@@ -852,12 +1141,12 @@ dpg_req_ratelimit(struct dpg_job *job, int rate)
 static void
 dpg_do_job(struct dpg_job *job)
 {
-	int i, rc, n_rx, n_reqs, n_rpls, room, txed, rx_bytes, tx_bytes;
+	int i, rc, n_rx, n_reqs, room, txed, rx_bytes, tx_bytes;
 	struct dpg_ether_hdr *eh;
 	struct rte_mbuf *m, *rx_pkts[DPG_MAX_PKT_BURST];
+	char proto[32];
 
 	rx_bytes = 0;
-	n_rpls = 0;
 	n_rx = rte_eth_rx_burst(job->port_id, job->queue_id, rx_pkts, DPG_ARRAY_SIZE(rx_pkts));
 
 	for (i = 0; i < n_rx; ++i) {
@@ -870,18 +1159,25 @@ dpg_do_job(struct dpg_job *job)
 
 		switch (eh->ether_type) {
 		case RTE_BE16(DPG_ETHER_TYPE_IPV4):
-			if (job->do_echo == 0) {
-				goto drop;
+			rc = dpg_ip_input(job, 0, eh + 1, m->pkt_len - sizeof(*eh));
+			if (rc == -EINVAL) {
+				if (job->verbose) {
+					dpg_log_custom(job, "IP");
+				}
 			}
-
-			rc = dpg_ip_input(job, m);
 			if (rc < 0) {
 				goto drop;
 			}
-			n_rpls++;
 			break;
+
+		case RTE_BE16(DPG_ETHER_TYPE_IPV6):
+			dpg_ipv6_input(job, m);
+			goto drop;
 		
 		case RTE_BE16(DPG_ETHER_TYPE_ARP):
+			if (job->verbose) {
+				dpg_log_custom(job, "ARP");
+			}
 			rc = dpg_arp_input(job, m);
 			if (rc < 0) {
 				goto drop;
@@ -889,6 +1185,11 @@ dpg_do_job(struct dpg_job *job)
 			break;
 
 		default:
+			if (job->verbose) {
+				snprintf(proto, sizeof(proto), "proto_0x%04hx",
+						rte_be_to_cpu_16(eh->ether_type));
+				dpg_log_custom(job, proto);
+			}
 			goto drop;
 		}
 
@@ -974,18 +1275,30 @@ dpg_get_stats(uint64_t *ipackets, uint64_t *ibytes, uint64_t *opackets, uint64_t
 }
 
 static void
-dpg_print_stat(uint64_t d_tsc)
+dpg_print_stat(double d_tsc)
 {
-	uint64_t ipps, ibps, opps, obps;
+	uint64_t dip, ipps, dib, ibps, dop, opps, dob, obps;
 	char ipps_b[40], ibps_b[40], opps_b[40], obps_b[40];
 	static uint64_t ipackets[2], ibytes[2], opackets[2], obytes[2];
 	static int p, reports;
 
 	dpg_get_stats(&ipackets[p], &ibytes[p], &opackets[p], &obytes[p]);
-	ipps = (ipackets[p] - ipackets[1 - p]) * g_hz / d_tsc;
-	ibps = 8 * (ibytes[p] - ibytes[1 - p]) * g_hz / d_tsc;
-	opps = (opackets[p] - opackets[1 - p]) * g_hz / d_tsc;
-	obps = 8 * (obytes[p] - obytes[1 - p]) * g_hz / d_tsc;
+	dip = ipackets[p] - ipackets[1 - p];
+	dib = ibytes[p] - ibytes[1 - p];
+	dop = opackets[p] - opackets[1 - p];
+	dob = obytes[p] - obytes[1 - p];
+
+	if (0) {
+		ipps = ceil(dip * g_hz / d_tsc);
+		ibps = ceil(8 * dip * g_hz / d_tsc);
+		opps = ceil(dop * g_hz / d_tsc);
+		obps = ceil(8 * dob * g_hz / d_tsc);
+	} else {
+		ipps = dip;
+		ibps = dib;
+		opps = dop;
+		obps = dob;
+	}
 
 	p = 1 - p;
 
@@ -1034,11 +1347,10 @@ dpg_lcore_loop(void *dummy)
 	stat_time = tsc;
 
 	for (job = lcore->jobs; job != NULL; job = job->lcore_next) {
-		job->icmp_seq_nb = DPG_ICMP_SEQ_NB_START;
 		job->src_ip_current = job->src_ip_start;
 		job->dst_ip_current = job->dst_ip_start;
 		job->icmp_id_current = job->icmp_id_start;
-
+		job->icmp_seq_current = job->icmp_seq_start;
 		job->req_tx_time = tsc;
 	}
 
@@ -1095,6 +1407,7 @@ main(int argc, char **argv)
 	dpg_parse_ip_interval("1.1.1.1", &tmpl->src_ip_start, &tmpl->src_ip_end);
 	dpg_parse_ip_interval("2.2.2.2", &tmpl->dst_ip_start, &tmpl->dst_ip_end);
 	tmpl->icmp_id_start = tmpl->icmp_id_end = 1;
+	tmpl->icmp_seq_start = tmpl->icmp_seq_end = 1;
 	tmpl->pkt_len = DPG_PKT_LEN_MIN;
 
 	while (argc > 1) {
