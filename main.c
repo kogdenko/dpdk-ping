@@ -98,6 +98,11 @@ typedef struct rte_ether_addr dpg_ether_addr_t;
 #define dpg_dev_name(dev) rte_dev_name(dev)
 #endif
 
+struct dpg_dlist {
+	struct dpg_dlist *dls_next;
+	struct dpg_dlist *dls_prev;
+};
+
 struct dpg_counter {
 	uint64_t per_lcore[RTE_MAX_LCORE];
 };
@@ -256,20 +261,20 @@ struct dpg_iter {
 };
 
 struct dpg_job {
-	struct dpg_job *lcore_next;
-	struct dpg_job *port_next;
+	struct dpg_dlist llist;
+	struct dpg_dlist plist;
 
-	int do_req;
-	int do_echo;
+	bool do_req;
+	bool do_echo;
 
-	int verbose;
+	uint8_t verbose[2];
 
-	int port_id;
-	int queue_id;
+	uint8_t port_id;
+	uint8_t queue_id;
 
 	int lcore_id;
 
-	int req_rate;
+	volatile int rps;
 	uint64_t req_tx_time;
 
 	dpg_ether_addr_t dst_eth_addr;
@@ -295,16 +300,37 @@ struct dpg_job {
 };
 
 struct dpg_port {
+	dpg_ether_addr_t mac_addr;
+
+	int rps_max;
+	int rps_cur;
+	int rps_fallback;
+	int rps_step;
+	uint8_t rps_qos;
+	uint8_t rps_tries;
+
+	struct dpg_counter ipackets;
+	struct dpg_counter opackets;
+	struct dpg_counter ibytes;
+	struct dpg_counter obytes;
+
+	uint64_t ipackets_prev;
+	uint64_t opackets_prev;
+	uint64_t ibytes_prev;
+	uint64_t obytes_prev;
+
+	struct dpg_dlist job_head;
+
 	uint16_t n_rxd;
 	uint16_t n_txd;
 	int n_queues;
-	dpg_ether_addr_t mac_addr;
-	struct dpg_job *jobs;
+	int n_jobs;
+
 	struct rte_eth_conf conf;
 };
 
 struct dpg_lcore {
-	struct dpg_job *jobs;
+	struct dpg_dlist job_head;
 	uint64_t tsc;
 	int is_first;
 };
@@ -316,10 +342,7 @@ static struct rte_mempool *g_pktmbuf_pool;
 static struct rte_eth_conf g_port_conf;
 static int g_bflag;
 static bool g_hardware_statistics = true;
-struct dpg_counter g_ipackets;
-struct dpg_counter g_opackets;
-struct dpg_counter g_ibytes;
-struct dpg_counter g_obytes;
+static bool g_slow_start = false;
 
 #define DPG_SWAP(a, b) do { \
 	typeof(a) tmp = a; \
@@ -331,6 +354,11 @@ struct dpg_counter g_obytes;
 #define DPG_MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #define DPG_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+#define dpg_field_off(type, field) ((intptr_t)&((type *)0)->field)
+
+#define dpg_container_of(ptr, type, field) \
+	((type *)((intptr_t)(ptr) - dpg_field_off(type, field)))
 
 #define dpg_die(...) \
 	rte_exit(EXIT_FAILURE, ##__VA_ARGS__);
@@ -383,6 +411,41 @@ dpg_memcmpz(const void *ptr, size_t n)
 	}
 	return 0;
 }
+
+static void
+dpg_dlist_init(struct  dpg_dlist *head)
+{
+	head->dls_next = head->dls_prev = head;
+}
+
+int
+dpg_dlist_is_empty(struct dpg_dlist *head)
+{
+	return head->dls_next == head;
+}
+
+#define DPG_DLIST_FIRST(head, type, field) \
+	dpg_container_of((head)->dls_next, type, field)
+
+#define DPG_DLIST_NEXT(var, field) \
+	dpg_container_of((var)->field.dls_next, __typeof__(*(var)), field)
+
+#define DPG_DLIST_FOREACH(var, head, field) \
+	for (var = DPG_DLIST_FIRST(head, typeof(*(var)), field); \
+	     &((var)->field) != (head); \
+	     var = DPG_DLIST_NEXT(var, field))
+
+void
+dpg_dlist_insert_head(struct dpg_dlist *head, struct dpg_dlist *l)
+{
+	l->dls_next = head->dls_next;
+	l->dls_prev = head;
+	head->dls_next->dls_prev = l;
+	head->dls_next = l;
+}
+
+#define DPG_DLIST_INSERT_HEAD(head, var, field) \
+	dpg_dlist_insert_head(head, &((var)->field))
 
 static void
 dpg_counter_add(struct dpg_counter *c, uint64_t add)
@@ -640,13 +703,13 @@ dpg_iter_interval_increment(struct dpg_iter_base *it_base)
 	struct dpg_iter_interval *it;
 
 	it = (struct dpg_iter_interval *)it_base;
-	assert(memcmp(it->current, it->end, it->item_size) < 0);
-	(*it->increment)(it->current);
 	cmp = memcmp(it->current, it->end, it->item_size);
+	assert(cmp <= 0);
 	if (cmp == 0) {
 		memcpy(it->current, it->begin, it->item_size);
 		return true;
 	} else {
+		(*it->increment)(it->current);
 		return false;
 	}
 }
@@ -1232,7 +1295,7 @@ dpg_log_hwaddr(struct dpg_job *job, struct dpg_strbuf *sb, struct dpg_ether_hdr 
 	char shbuf[DPG_ETHER_ADDR_FMT_SIZE];
 	char dhbuf[DPG_ETHER_ADDR_FMT_SIZE];
 
-	if (job->verbose < 2 || eh == NULL) {
+	if (job->verbose[DPG_RX] < 2 || eh == NULL) {
 		return;
 	}
 
@@ -1251,7 +1314,7 @@ dpg_log_icmp(struct dpg_job *job, int dir, struct dpg_ether_hdr *eh, struct dpg_
 	char logbuf[DPG_LOG_BUFSIZE];
 	struct dpg_strbuf sb;
 
-	if (!job->verbose) {
+	if (!job->verbose[dir]) {
 		return;
 	}
 
@@ -1291,7 +1354,7 @@ dpg_log_arp(struct dpg_job *job, int dir, struct dpg_ether_hdr *eh, struct dpg_a
 	char logbuf[DPG_LOG_BUFSIZE];
 	struct dpg_strbuf sb;
 
-	if (!job->verbose) {
+	if (!job->verbose[dir]) {
 		return;
 	}
 
@@ -1306,7 +1369,7 @@ dpg_log_arp(struct dpg_job *job, int dir, struct dpg_ether_hdr *eh, struct dpg_a
 	dpg_ether_format_addr(thbuf, sizeof(thbuf), &ah->arp_tha);
 	dpg_ether_format_addr(shbuf, sizeof(shbuf), &ah->arp_sha);
 
-	dpg_strbuf_addf(&sb, ": %s ARP %s %s(%s)->%s(%s)\n",
+	dpg_strbuf_addf(&sb, ": %s ARP %s %s(%s)->%s(%s)",
 			dir == DPG_TX ? "Sent" : "Recv",
 			is_req ? "request" : "reply",
 			sibuf, shbuf, tibuf, thbuf);
@@ -1315,7 +1378,7 @@ dpg_log_arp(struct dpg_job *job, int dir, struct dpg_ether_hdr *eh, struct dpg_a
 }
 
 static void
-dpg_log_ipv6(struct dpg_job *job, struct dpg_ether_hdr *eh, struct dpg_ipv6_hdr *ih,
+dpg_log_ipv6(struct dpg_job *job, int dir, struct dpg_ether_hdr *eh, struct dpg_ipv6_hdr *ih,
 		const char *desc)
 {
 	char srcbuf[INET6_ADDRSTRLEN];
@@ -1323,7 +1386,7 @@ dpg_log_ipv6(struct dpg_job *job, struct dpg_ether_hdr *eh, struct dpg_ipv6_hdr 
 	char logbuf[DPG_LOG_BUFSIZE];
 	struct dpg_strbuf sb;
 
-	if (!job->verbose) {
+	if (!job->verbose[dir]) {
 		return;
 	}
 
@@ -1335,7 +1398,8 @@ dpg_log_ipv6(struct dpg_job *job, struct dpg_ether_hdr *eh, struct dpg_ipv6_hdr 
 	inet_ntop(AF_INET6, ih->src_addr.as_bytes, srcbuf, sizeof(srcbuf));
 	inet_ntop(AF_INET6, ih->dst_addr.as_bytes, dstbuf, sizeof(dstbuf));
 
-	dpg_strbuf_addf(&sb, ": Recv %s->%s: %s", srcbuf, dstbuf, desc);
+	dpg_strbuf_addf(&sb, ": %s %s->%s: %s", dir == DPG_RX ? "Recv" : "Sent",
+			srcbuf, dstbuf, desc);
 
 	printf("%s\n", dpg_strbuf_cstr(&sb));
 }
@@ -1346,7 +1410,7 @@ dpg_log_custom(struct dpg_job *job, struct dpg_ether_hdr *eh, const char *proto)
 	char logbuf[DPG_LOG_BUFSIZE];
 	struct dpg_strbuf sb;
 
-	if (!job->verbose) {
+	if (!job->verbose[DPG_RX]) {
 		return;
 	}
 
@@ -1408,11 +1472,10 @@ dpg_job_copy(struct dpg_job *dst, struct dpg_job *src)
 {
 	dst->do_req = src->do_req;
 	dst->do_echo = src->do_echo;
-	dst->verbose = src->verbose;
+	memcpy(dst->verbose, src->verbose, sizeof(dst->verbose));
 	dst->port_id = src->port_id;
 	dst->queue_id = src->queue_id;
 	dst->lcore_id = src->lcore_id;
-	dst->req_rate = src->req_rate;
 	dst->dst_eth_addr = src->dst_eth_addr;
 
 	dpg_iter_copy(&dst->src_ip, &src->src_ip);
@@ -1435,7 +1498,7 @@ dpg_job_copy(struct dpg_job *dst, struct dpg_job *src)
 static int
 dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv)
 {
-	int opt, option_index, do_echo, do_req, queue_id;
+	int opt, option_index, do_echo, do_req, queue_id, rps_max;
 	int64_t rc;
 	uint16_t port_id;
 	char *endptr;
@@ -1447,6 +1510,9 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 
 	static struct option long_options[] = {
 		{ "help", no_argument, 0, 'h' },
+		{ "rx-verbose", required_argument, 0, 0 },
+		{ "tx-verbose", required_argument, 0, 0 },
+		{ "slow-start",  required_argument, 0, 0 },
 		{ "hardware-statistics", required_argument, 0, 0 },
 		{ "icmp-id", required_argument, 0, 0 },
 		{ "icmp-seq", required_argument, 0, 0 },
@@ -1459,14 +1525,23 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 
 	dpg_job_copy(job, tmpl);
 
-	do_echo = do_req = queue_id = -1;
+	do_echo = do_req = queue_id = rps_max = -1;
 
 	while ((opt = getopt_long(argc, argv, "hV:bl:p:q:RE4:6:B:H:s:d:L:",
 			long_options, &option_index)) != -1) {
 		switch (opt) {
 		case 0:
 			optname = long_options[option_index].name;
-			if (!strcmp(optname, "hardware-statistics")) {
+			if (!strcmp(optname, "rx-verbose")) {
+				job->verbose[DPG_RX] = strtoul(optarg, NULL, 10);
+			} else if (!strcmp(optname, "tx-verbose")) {
+				job->verbose[DPG_TX] = strtoul(optarg, NULL, 10);
+			} else if (!strcmp(optname, "slow-start")) {
+				rc = dpg_parse_bool(optarg, &g_slow_start);
+				if (rc < 0) {
+					dpg_invalid_argument(0, optname);
+				}
+			} else if (!strcmp(optname, "hardware-statistics")) {
 				rc = dpg_parse_bool(optarg, &g_hardware_statistics);
 				if (rc < 0) {
 					dpg_invalid_argument(0, optname);
@@ -1501,7 +1576,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			break;
 
 		case 'V':
-			job->verbose = strtoul(optarg, NULL, 10);
+			job->verbose[DPG_RX] = job->verbose[DPG_TX] = strtoul(optarg, NULL, 10);
 			break;
 
 		case 'b':
@@ -1571,7 +1646,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 			if (rc < 0) {
 				dpg_invalid_argument(opt, NULL);
 			}
-			job->req_rate = rc;
+			rps_max = rc;
 			break;
 
 		case 'H':
@@ -1613,9 +1688,7 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 	}
 
 	lcore = g_lcores + job->lcore_id;
-	tmp = lcore->jobs;
-	lcore->jobs = job;
-	job->lcore_next = tmp;
+	DPG_DLIST_INSERT_HEAD(&lcore->job_head, job, llist);
 
 	if (job->port_id == tmpl->port_id) {
 		if (do_req < 0) {
@@ -1652,18 +1725,22 @@ dpg_parse_job(struct dpg_job **pjob, struct dpg_job *tmpl, int argc, char **argv
 	}
 
 	port = g_ports + job->port_id;
-	for (tmp = port->jobs; tmp != NULL; tmp = tmp->port_next) {
+	DPG_DLIST_FOREACH(tmp, &port->job_head, plist) {
 		if (job->queue_id == tmp->queue_id) {
 			rte_eth_dev_get_name_by_port(job->port_id, port_name);
 			dpg_die("Duplicate job for port '%s' queue %d\n",
 					port_name, job->queue_id);
 		}
 	}
-	port->n_queues = DPG_MAX(port->n_queues, job->queue_id + 1);
-	tmp = port->jobs;
-	port->jobs = job;
-	job->port_next = tmp;
+	DPG_DLIST_INSERT_HEAD(&port->job_head, job, plist);
 
+	port->n_queues = DPG_MAX(port->n_queues, job->queue_id + 1);
+	port->n_jobs++;
+
+	if (rps_max >= 0) {
+		port->rps_max = rps_max;
+	}
+	
 	*pjob = job;
 
 	return optind;
@@ -1957,19 +2034,21 @@ dpg_ipv6_input(struct dpg_job *job, struct rte_mbuf *m)
 			ptr += sizeof(*ns);
 			len -= sizeof(*ns);
 
-			if (job->verbose) {
+			if (job->verbose[DPG_RX]) {
 				inet_ntop(AF_INET6, ns->target.as_bytes, tgtbuf, sizeof(tgtbuf));
 				snprintf(desc, sizeof(desc), "Neighbour Solicitation (target=%s)",
 						tgtbuf);
-				dpg_log_ipv6(job, eh, ih6, desc);
+				dpg_log_ipv6(job, DPG_RX, eh, ih6, desc);
 			}
 
 			rc = dpg_iter_find(&job->addresses6, &ns->target);
 			if (rc < 0) {
-				return 0;
+				return -EINVAL;
 			}
 
 			dpg_create_neighbour_advertisment(job, m, ih6, ns);
+
+			dpg_log_ipv6(job, DPG_TX, NULL, ih6, "Neighbour Advertisment");
 
 			return 0;
 
@@ -1986,9 +2065,9 @@ dpg_ipv6_input(struct dpg_job *job, struct rte_mbuf *m)
 	}
 
 out:
-	if (job->verbose) {
+	if (job->verbose[DPG_RX]) {
 		snprintf(desc, sizeof(desc), "proto %d", proto);
-		dpg_log_ipv6(job, eh, ih6, desc);
+		dpg_log_ipv6(job, DPG_RX, eh, ih6, desc);
 	}
 	return -EINVAL;
 
@@ -2034,7 +2113,7 @@ dpg_add_tx(struct dpg_job *job, struct rte_mbuf *m)
 }
 
 static int
-dpg_req_ratelimit(struct dpg_job *job, int rate)
+dpg_rps_ratelimit(struct dpg_job *job, int rate)
 {
 	int n_reqs, room, dp;
 	uint64_t tsc, dt;
@@ -2058,6 +2137,7 @@ dpg_do_job(struct dpg_job *job)
 {
 	int i, rc, n_rx, n_reqs, room, txed, rx_bytes, tx_bytes;
 	struct dpg_ether_hdr *eh;
+	struct dpg_port *port;
 	struct rte_mbuf *m, *rx_pkts[DPG_MAX_PKT_BURST];
 	char proto[32];
 
@@ -2098,7 +2178,7 @@ dpg_do_job(struct dpg_job *job)
 			break;
 
 		default:
-			if (job->verbose) {
+			if (job->verbose[DPG_RX]) {
 				snprintf(proto, sizeof(proto), "proto 0x%04hx",
 						rte_be_to_cpu_16(eh->ether_type));
 				dpg_log_custom(job, eh, proto);
@@ -2118,8 +2198,10 @@ drop:
 
 	room = DPG_TXBUF_SIZE - job->n_tx_pkts;
 	if (job->do_req && room) {
-		if (job->req_rate) {
-			n_reqs = dpg_req_ratelimit(job, job->req_rate);
+		if (job->rps == 0) {
+			n_reqs = 0;
+		} else if (job->rps > 0) {
+			n_reqs = dpg_rps_ratelimit(job, job->rps);
 		} else {
 			n_reqs = room;
 		}
@@ -2147,73 +2229,171 @@ drop:
 			job->tx_bytes += job->tx_pkts[i]->pkt_len;
 		}
 
-		dpg_counter_add(&g_ipackets, n_rx);
-		dpg_counter_add(&g_ibytes, rx_bytes);
+		port = g_ports + job->port_id;
 
-		dpg_counter_add(&g_opackets, txed);
-		dpg_counter_add(&g_obytes, tx_bytes - job->tx_bytes);
+		dpg_counter_add(&port->ipackets, n_rx);
+		dpg_counter_add(&port->ibytes, rx_bytes);
+
+		dpg_counter_add(&port->opackets, txed);
+		dpg_counter_add(&port->obytes, tx_bytes - job->tx_bytes);
+	}
+}
+
+static int
+dpg_compute_rps(struct dpg_port *port)
+{
+	int rps;
+	char port_name[RTE_ETH_NAME_MAX_LEN];
+	char rps_buf[32], rps_prev_buf[32], rps_fallback_buf[32], rps_step_buf[32];
+
+	if (port->rps_max < 2 || !g_slow_start) {
+		return port->rps_max;
+	}
+
+	if (port->rps_cur < 1) {
+		return 1;
+	}
+
+	rps = port->rps_cur;
+	
+	if (port->rps_qos == 10) {
+		port->rps_qos = port->rps_tries = 0;
+		port->rps_fallback = port->rps_cur;
+		if (port->rps_step == 0) {
+			rps = port->rps_cur * 10;
+		} else {
+			rps = port->rps_cur + port->rps_step;
+		}
+	} else if (port->rps_tries == 60) {
+		port->rps_qos = port->rps_tries = 0;
+		if (port->rps_step == 0) {
+			port->rps_step = DPG_MAX(1, port->rps_fallback);
+		} else {
+			port->rps_step = DPG_MAX(1, port->rps_step/10);
+		}
+		rps = port->rps_fallback + port->rps_step;
+	}
+
+	rps = DPG_MIN(rps, port->rps_max);
+
+	if (rps != port->rps_cur) {
+		rte_eth_dev_get_name_by_port(port - g_ports, port_name);
+		dpg_norm(rps_prev_buf, port->rps_cur, 1);
+		dpg_norm(rps_buf, rps, 1);
+		dpg_norm(rps_fallback_buf, port->rps_fallback, 1);
+		dpg_norm(rps_step_buf, port->rps_step, 1);
+
+		printf("%s: RPS: %s->%s (fallback=%s, step=%s)\n",
+				port_name, rps_prev_buf, rps_buf, rps_fallback_buf, rps_step_buf);
+	}
+
+	return rps;
+}
+
+static void
+dpg_update_rps(struct dpg_port *port)
+{
+	int rps_per_job, rps_rem, rps_cur;
+	struct dpg_job *job;
+
+	if (port->rps_cur == port->rps_max) {
+		return;
+	}
+
+	rps_cur = dpg_compute_rps(port);
+
+	if (port->rps_cur == rps_cur) {
+		return;
+	}
+
+	port->rps_cur = rps_cur;
+	if (port->rps_cur < 0) {
+		rps_per_job = -1;
+		rps_rem = 0;
+	} else {
+		rps_per_job = rps_cur/port->n_jobs;
+		rps_rem = rps_cur % port->n_jobs;
+	}
+
+	DPG_DLIST_FOREACH(job, &port->job_head, plist) {
+		job->rps = rps_per_job + rps_rem;
+		rps_rem = 0;
 	}
 }
 
 static void
-dpg_get_stats(uint64_t *ipackets, uint64_t *ibytes, uint64_t *opackets, uint64_t *obytes)
+dpg_get_stats(uint64_t *ipps_accum, uint64_t *ibps_accum,
+		uint64_t *opps_accum, uint64_t *obps_accum)
 {
 	int port_id;
+	uint64_t ip, ib, op, ob;
+	unsigned long long ipps, ibps, opps, obps;
 	struct rte_eth_stats stats;
+	struct dpg_port *port;
 
-	*ipackets = 0;
-	*ibytes = 0;
-	*opackets = 0;
-	*obytes = 0;
+	*ipps_accum = 0;
+	*ibps_accum = 0;
+	*opps_accum = 0;
+	*obps_accum = 0;
 
-	if (g_hardware_statistics) {
-		RTE_ETH_FOREACH_DEV(port_id) {
-			if (!dpg_port_is_configured(g_ports + port_id)) {
-				continue;
-			}
+	RTE_ETH_FOREACH_DEV(port_id) {
+		port = g_ports + port_id;
 
+		if (!dpg_port_is_configured(port)) {
+			continue;
+		}
+
+		if (g_hardware_statistics) {
 			rte_eth_stats_get(port_id, &stats);
 
-			*ipackets += stats.ipackets;
-			*ibytes += stats.ibytes;
-			*opackets += stats.opackets;
-			*obytes += stats.obytes;
+			ip = stats.ipackets;
+			ib = stats.ibytes;
+			op = stats.opackets;
+			ob = stats.obytes;
+		} else {
+			ip = dpg_counter_get(&port->ipackets);
+			ib = dpg_counter_get(&port->ibytes);
+			op = dpg_counter_get(&port->opackets);
+			ob = dpg_counter_get(&port->obytes);
 		}
-	} else {
-		*ipackets = dpg_counter_get(&g_ipackets);
-		*ibytes = dpg_counter_get(&g_ibytes);
-		*opackets = dpg_counter_get(&g_opackets);
-		*obytes = dpg_counter_get(&g_obytes);
+
+		ipps = ip - port->ipackets_prev;
+		port->ipackets_prev = ip;
+
+		ibps = ib - port->ibytes_prev;
+		port->ibytes_prev = ib;
+
+		opps = op - port->opackets_prev;
+		port->opackets_prev = op;
+
+		obps = ob - port->obytes_prev;
+		port->obytes_prev = ob;
+
+		port->rps_tries++;
+
+		if (ipps >= opps || 10 * (opps - ipps) < opps) {
+			port->rps_qos++;
+		} else {
+			port->rps_qos = 0;
+		}
+
+		dpg_update_rps(port);
+
+		*ipps_accum += ipps;
+		*ibps_accum += ibps;
+		*opps_accum += opps;
+		*obps_accum += obps;
 	}
 }
 
 static void
 dpg_print_stat(double d_tsc)
 {
-	uint64_t dip, ipps, dib, ibps, dop, opps, dob, obps;
+	uint64_t ipps, ibps, opps, obps;
 	char ipps_b[40], ibps_b[40], opps_b[40], obps_b[40];
-	static uint64_t ipackets[2], ibytes[2], opackets[2], obytes[2];
-	static int p, reports;
+	static int reports;
 
-	dpg_get_stats(&ipackets[p], &ibytes[p], &opackets[p], &obytes[p]);
-	dip = ipackets[p] - ipackets[1 - p];
-	dib = ibytes[p] - ibytes[1 - p];
-	dop = opackets[p] - opackets[1 - p];
-	dob = obytes[p] - obytes[1 - p];
-
-	if (0) {
-		ipps = ceil(dip * g_hz / d_tsc);
-		ibps = ceil(8 * dip * g_hz / d_tsc);
-		opps = ceil(dop * g_hz / d_tsc);
-		obps = ceil(8 * dob * g_hz / d_tsc);
-	} else {
-		ipps = dip;
-		ibps = dib;
-		opps = dop;
-		obps = dob;
-	}
-
-	p = 1 - p;
+	dpg_get_stats(&ipps, &ibps, &opps, &obps);
 
 	if (reports == 20) {
 		reports = 0;
@@ -2259,14 +2439,14 @@ dpg_lcore_loop(void *dummy)
 	tsc = rte_rdtsc();
 	stat_time = tsc;
 
-	for (job = lcore->jobs; job != NULL; job = job->lcore_next) {
+	DPG_DLIST_FOREACH(job, &lcore->job_head, llist) {
 		job->req_tx_time = tsc;
 	}
 
 	for (;;) {
 		lcore->tsc = rte_rdtsc();
 
-		for (job = lcore->jobs; job != NULL; job = job->lcore_next) {
+		DPG_DLIST_FOREACH(job, &lcore->job_head, llist) {
 			dpg_do_job(job);
 		}
 
@@ -2307,6 +2487,17 @@ main(int argc, char **argv)
 #endif
 
 	g_hz = rte_get_tsc_hz();
+
+	for (i = 0; i < DPG_ARRAY_SIZE(g_ports); ++i) {
+		port = g_ports + i;
+		port->rps_max = -1;
+		dpg_dlist_init(&port->job_head);
+	}
+
+	for (i = 0; i < DPG_ARRAY_SIZE(g_lcores); ++i) {
+		lcore = g_lcores + i;
+		dpg_dlist_init(&lcore->job_head);
+	}
 
 	g_port_conf.txmode.mq_mode = DPG_ETH_MQ_TX_NONE;
 
@@ -2460,33 +2651,40 @@ main(int argc, char **argv)
 			printf("rte_eth_dev_set_link_up('%s') failed (%d:%s)\n",
 					port_name, -rc, rte_strerror(-rc));
 		}
+
+		dpg_update_rps(port);
 	}
 
 	first_lcore = -1;
 	RTE_LCORE_FOREACH(i) {
 		lcore = g_lcores + i;
-		if (lcore->jobs == NULL) {
+
+		if (dpg_dlist_is_empty(&lcore->job_head)) {
 			continue;
 		}
+
 		if (first_lcore < 0) {
 			first_lcore = i;
 			lcore->is_first = 1;
 		}
+
 		if (i != main_lcore) {
 			rte_eal_remote_launch(dpg_lcore_loop, NULL, i);
 		}
 	}
 
 	lcore = g_lcores + main_lcore;
-	if (lcore->jobs != NULL) {
+	if (!dpg_dlist_is_empty(&lcore->job_head)) {
 		dpg_lcore_loop(NULL);
 	}
 
 	RTE_LCORE_FOREACH(i) {
 		lcore = g_lcores + i;
-		if (lcore->jobs == NULL) {
+
+		if (dpg_dlist_is_empty(&lcore->job_head)) {
 			continue;
 		}
+
 		if (i != main_lcore) {
 			rte_eal_wait_lcore(i);
 		}
