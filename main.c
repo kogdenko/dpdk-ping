@@ -25,6 +25,8 @@
 
 #define DPG_LOG_BUFSIZE 512
 
+#define DPG_SLOWSTART_RPS_MIN 5
+
 #define DPG_PKT_LEN_MIN 60
 
 #define DPG_ETHER_ADDR_FMT_SIZE 18
@@ -2246,12 +2248,12 @@ dpg_compute_rps(struct dpg_port *port)
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 	char rps_buf[32], rps_prev_buf[32], rps_fallback_buf[32], rps_step_buf[32];
 
-	if (port->rps_max < 2 || !g_slow_start) {
+	if (port->rps_max <= DPG_SLOWSTART_RPS_MIN || !g_slow_start) {
 		return port->rps_max;
 	}
 
-	if (port->rps_cur < 1) {
-		return 1;
+	if (port->rps_cur < DPG_SLOWSTART_RPS_MIN) {
+		return DPG_SLOWSTART_RPS_MIN;
 	}
 
 	rps = port->rps_cur;
@@ -2371,7 +2373,7 @@ dpg_get_stats(uint64_t *ipps_accum, uint64_t *ibps_accum,
 
 		port->rps_tries++;
 
-		if (ipps >= opps || 10 * (opps - ipps) < opps) {
+		if (ipps >= opps || 10 * (opps - ipps) < opps || opps - ipps == 1) {
 			port->rps_qos++;
 		} else {
 			port->rps_qos = 0;
