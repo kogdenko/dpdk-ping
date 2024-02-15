@@ -24,6 +24,8 @@
 #define DPG_RX 0
 #define DPG_TX 1
 
+#define DPG_IPV6_ADDR_SIZE 16
+
 #define DPG_RPS_DEFAULT 200*1000*1000
 #define DPG_SRC_IP_DEFAULT "1.1.1.1"
 #define DPG_DST_IP_DEFAULT "2.2.2.2"
@@ -129,8 +131,11 @@ struct dpg_darray {
 	uint8_t *data;
 };
 
-struct dpg_ipv6_addr {
-	uint8_t as_bytes[16];
+struct dpg_ipv6 {
+	union {
+		uint8_t as_bytes[16];
+		uint64_t as_u64[2];
+	};
 };
 
 struct dpg_eth_hdr {
@@ -188,8 +193,8 @@ struct dpg_ipv6_hdr {
 	rte_be16_t payload_len;
 	uint8_t proto;
 	uint8_t hop_limits;
-	struct dpg_ipv6_addr src_addr;
-	struct dpg_ipv6_addr dst_addr;
+	uint8_t src_addr[DPG_IPV6_ADDR_SIZE];
+	uint8_t dst_addr[DPG_IPV6_ADDR_SIZE];
 } DPG_PACKED;
 
 struct dpg_icmpv6_hdr {
@@ -199,8 +204,8 @@ struct dpg_icmpv6_hdr {
 } DPG_PACKED;
 
 struct dpg_ipv6_pseudohdr {
-	struct dpg_ipv6_addr src_addr;
-	struct dpg_ipv6_addr dst_addr;
+	uint8_t src_addr[DPG_IPV6_ADDR_SIZE];
+	uint8_t dst_addr[DPG_IPV6_ADDR_SIZE];
 	rte_be32_t len;
 	rte_be32_t proto;
 } DPG_PACKED;
@@ -210,7 +215,7 @@ struct dpg_icmpv6_neigh_solicitaion {
 	uint8_t code;
 	uint16_t checksum;
 	uint32_t reserved;
-	struct dpg_ipv6_addr target;
+	uint8_t target[DPG_IPV6_ADDR_SIZE];
 } DPG_PACKED;
 
 struct dpg_icmpv6_neigh_advertisment {
@@ -218,7 +223,7 @@ struct dpg_icmpv6_neigh_advertisment {
 	uint8_t code;
 	uint16_t checksum;
 	uint32_t flags;
-	struct dpg_ipv6_addr target;
+	uint8_t target[DPG_IPV6_ADDR_SIZE];
 } DPG_PACKED;
 
 struct dpg_target_link_layer_address_option {
@@ -235,7 +240,7 @@ struct dpg_srv6_hdr {
 	uint8_t last_entry;
 	uint8_t flags;
 	rte_be16_t tag;
-	struct dpg_ipv6_addr localsid;
+	uint8_t localsid[DPG_IPV6_ADDR_SIZE];
 } DPG_PACKED;
 
 struct dpg_iter_base {
@@ -295,7 +300,7 @@ struct dpg_task {
 	struct dpg_iter icmp_seq;
 
 	int srv6;
-	struct dpg_ipv6_addr srv6_src;
+	struct dpg_ipv6 srv6_src;
 	struct dpg_iter srv6_dst;
 
 	uint16_t pkt_len;
@@ -358,9 +363,10 @@ static u_int g_dpg_no_drop_tries = 30;
 static u_int g_dpg_no_drop_seq = 10;
 
 #define DPG_SWAP(a, b) do { \
-	typeof(a) tmp = a; \
-	a = b; \
-	b = tmp; \
+	typeof(a) t; \
+	memcpy(&(t), &(a), sizeof(t)); \
+	memcpy(&(a), &(b), sizeof(a)); \
+	memcpy(&(b), &(t), sizeof(b)); \
 } while (0)
 
 #define DPG_MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -481,7 +487,7 @@ dpg_counter_get(struct dpg_counter *c)
 }
 
 static int
-dpg_ipv6_iszero(struct dpg_ipv6_addr *a)
+dpg_ipv6_iszero(struct dpg_ipv6 *a)
 {
 	return !dpg_memcmpz(a->as_bytes, sizeof(a));
 }
@@ -766,7 +772,6 @@ dpg_iter_interval_find(struct dpg_iter_base *it_base, void *item)
 
 static void
 dpg_iter_interval_deinit(struct dpg_iter_base *it_base)
-
 {
 	struct dpg_iter_interval *it;
 
@@ -979,7 +984,7 @@ static void
 dpg_increment_ipv6(void *p)
 {
 	int i;
-	struct dpg_ipv6_addr *a;
+	struct dpg_ipv6 *a;
 
 	a = p;
 
@@ -1074,6 +1079,12 @@ dpg_parse_ipv6(char *str, void *a)
 	} else {
 		return -EINVAL;
 	}
+}
+
+static void
+dpg_ipv6_hton(uint8_t *dst, struct dpg_ipv6 *a)
+{
+	memcpy(dst, a->as_bytes, DPG_IPV6_ADDR_SIZE);
 }
 
 static int
@@ -1366,8 +1377,8 @@ dpg_log_ipv6(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_
 	dpg_log_port(task, &sb);
 	dpg_log_hwaddr(task, &sb, eh);
 
-	inet_ntop(AF_INET6, ih->src_addr.as_bytes, srcbuf, sizeof(srcbuf));
-	inet_ntop(AF_INET6, ih->dst_addr.as_bytes, dstbuf, sizeof(dstbuf));
+	inet_ntop(AF_INET6, ih->src_addr, srcbuf, sizeof(srcbuf));
+	inet_ntop(AF_INET6, ih->dst_addr, dstbuf, sizeof(dstbuf));
 
 	dpg_strbuf_addf(&sb, ": %s %s->%s: %s", dir == DPG_RX ? "Recv" : "Sent",
 			srcbuf, dstbuf, desc);
@@ -1432,7 +1443,7 @@ dpg_iter_parse_ipv6(char *str, struct dpg_iter *it)
 {
 	int rc;
 
-	rc = dpg_iter_parse(str, it, sizeof(struct dpg_ipv6_addr), dpg_parse_ipv6,
+	rc = dpg_iter_parse(str, it, sizeof(struct dpg_ipv6), dpg_parse_ipv6,
 			dpg_increment_ipv6);
 
 	return rc;
@@ -1826,7 +1837,7 @@ dpg_create_icmp_request(struct dpg_task *task)
 	int ih_total_length, pkt_len;
 	uint16_t *icmp_id, *icmp_seq;
 	uint32_t *src_ip, *dst_ip;
-	struct dpg_ipv6_addr *srv6_dst;
+	struct dpg_ipv6 *srv6_dst;
 	struct rte_mbuf *m;
 	struct dpg_eth_hdr *eh;
 	struct dpg_ipv4_hdr *ih;
@@ -1860,8 +1871,8 @@ dpg_create_icmp_request(struct dpg_task *task)
 		ih6->payload_len = rte_cpu_to_be_16(m->pkt_len - (sizeof(*eh) + sizeof(*ih6)));
 		ih6->proto = IPPROTO_ROUTING;
 		ih6->hop_limits = 64;
-		ih6->src_addr = task->srv6_src;
-		ih6->dst_addr = *srv6_dst;
+		dpg_ipv6_hton(ih6->src_addr, &task->srv6_src);
+		dpg_ipv6_hton(ih6->dst_addr, srv6_dst);
 
 		srh->next_header = IPPROTO_IPIP;
 		srh->hdr_ext_len = sizeof(*srh) / 8 - 1;
@@ -1870,7 +1881,7 @@ dpg_create_icmp_request(struct dpg_task *task)
 		srh->last_entry = 0;
 		srh->flags = 0;
 		srh->tag = 0;
-		srh->localsid = ih6->dst_addr;
+		memcpy(srh->localsid, ih6->dst_addr, DPG_IPV6_ADDR_SIZE);
 
 		overflow = dpg_iter_increment(&task->srv6_dst);
 	} else {
@@ -2002,7 +2013,7 @@ dpg_create_neighbour_advertisment(struct dpg_task *task, struct rte_mbuf *m,
 {
 	int len;
 	uint64_t sum;
-	struct dpg_ipv6_addr target;
+	uint16_t target[DPG_IPV6_ADDR_SIZE];
 	struct dpg_icmpv6_neigh_advertisment *na;
 	struct dpg_target_link_layer_address_option *opt;
 	struct dpg_ipv6_pseudohdr pseudo;
@@ -2010,12 +2021,12 @@ dpg_create_neighbour_advertisment(struct dpg_task *task, struct rte_mbuf *m,
 	len = sizeof(*na) + sizeof(*opt);
 	m->pkt_len = m->data_len = sizeof(struct dpg_eth_hdr) + sizeof(*ih) + len;
 
-	target = ns->target;
+	memcpy(target, ns->target, sizeof(target));
 
 	ih->payload_len = rte_cpu_to_be_16(len);
 	ih->proto = DPG_IPPROTO_ICMPV6;
 	DPG_SWAP(ih->src_addr, ih->dst_addr);
-	ih->src_addr = target;
+	memcpy(ih->src_addr, target, sizeof(target));
 
 	na = (struct dpg_icmpv6_neigh_advertisment *)(ih + 1);
 
@@ -2023,15 +2034,15 @@ dpg_create_neighbour_advertisment(struct dpg_task *task, struct rte_mbuf *m,
 	na->code = 0;
 	na->checksum = 0;
 	na->flags = rte_cpu_to_be_32(0x60000000);
-	na->target = target;
+	memcpy(na->target, target, sizeof(na->target));
 
 	opt = (struct dpg_target_link_layer_address_option *)(na + 1);
 	opt->type = 2;
 	opt->length = sizeof(*opt) / 8;
 	opt->address = g_dpg_ports[task->port_id].mac_addr;
 
-	pseudo.src_addr = ih->src_addr;
-	pseudo.dst_addr = ih->dst_addr;
+	memcpy(pseudo.src_addr, ih->src_addr, sizeof(pseudo.src_addr));
+	memcpy(pseudo.dst_addr, ih->dst_addr, sizeof(pseudo.dst_addr));
 	pseudo.proto = (uint32_t)(DPG_IPPROTO_ICMPV6 << 24);
 	pseudo.len = rte_cpu_to_be_32(len);
 
@@ -2101,7 +2112,7 @@ dpg_ipv6_input(struct dpg_task *task, struct rte_mbuf *m)
 			len -= sizeof(*ns);
 
 			if (task->verbose[DPG_RX]) {
-				inet_ntop(AF_INET6, ns->target.as_bytes, tgtbuf, sizeof(tgtbuf));
+				inet_ntop(AF_INET6, ns->target, tgtbuf, sizeof(tgtbuf));
 				snprintf(desc, sizeof(desc), "Neighbour Solicitation (target=%s)",
 						tgtbuf);
 				dpg_log_ipv6(task, DPG_RX, eh, ih6, desc);
