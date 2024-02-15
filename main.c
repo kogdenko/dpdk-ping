@@ -1344,7 +1344,7 @@ dpg_task_copy(struct dpg_task *dst, struct dpg_task *src)
 }
 
 static void
-dpg_print_usage(struct dpg_task *def)
+dpg_print_usage(void)
 {
 	int rc, port_id;
 	dpg_eth_addr_t mac_addr;
@@ -1352,7 +1352,6 @@ dpg_print_usage(struct dpg_task *def)
 	char eth_addr_buf[DPG_ETH_ADDRSTRLEN];
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 
-	dpg_eth_format_addr(eth_addr_buf, sizeof(eth_addr_buf), &def->dst_eth_addr);
 	dpg_norm(rate_buf, DPG_RPS_DEFAULT, 1);
 
 	printf("Usage: dpdk-ping [DPDK options] -- task [-- task [-- task ...]]\n"
@@ -1369,7 +1368,7 @@ dpg_print_usage(struct dpg_task *def)
 	"\t-4 {IP..}:  Interaface IP address iterator\n"
 	"\t-6 {IPv6..}:  Interface IPv6 address iterator\n"
 	"\t-B {packets per second}:  ICMP requests bandwidth (default:%s)\n"
-	"\t-H {ether address}:  Destination ethernet address (default: %s)\n"
+	"\t-H {ether address}:  Destination ethernet address (default: ff:ff:ff:ff:ff:ff)\n"
 	"\t-s {IP..}:  Source ip addresses iterator (default: %s)\n"
 	"\t-d {IP..}:  Destination ip addresses iterator (default: %s)\n"
 	"\t-L {bytes}:  Packet size (default: %d)\n"
@@ -1381,22 +1380,19 @@ dpg_print_usage(struct dpg_task *def)
 	"\t--srv6-dst {IPv6..}:  SRv6 tunnel destination address iterator\n"
 	"\t--software-counters {bool}:  Use software counters for reports (default: %s)\n"
 	"\t--no-drop {%%[,T[,t]]}:  Specify no-drop rate search algorithm parameters (default: %f,%u,%u)\n"
-	"\tIterator (it) of values x (x..):\n"
-	"\t\tit = {x|x-x}\n"
-	"\t\tit = {it[,it]}\n"
+	"\tIterator of values x (x..):  {x,x,x...|x-x}\n"
 	"Ports:\n",
 		dpg_bool_str(g_dpg_bflag),
-		def->lcore_id,
-		def->queue_id,
-		dpg_bool_str(def->do_req),
-		dpg_bool_str(def->do_echo),
+		0,
+		0,
+		dpg_bool_str(false),
+		dpg_bool_str(false),
 		rate_buf,
-		eth_addr_buf,
 		DPG_SRC_IP_DEFAULT,
 		DPG_DST_IP_DEFAULT,
-		def->pkt_len,
-		def->verbose[DPG_RX],
-		def->verbose[DPG_TX],
+		DPG_PKT_LEN_MIN,
+		0,
+		0,
 		DPG_ICMP_ID_DEFAULT,
 		DPG_ICMP_SEQ_DEFAULT,
 		dpg_bool_str(g_dpg_software_counters),
@@ -1421,8 +1417,7 @@ dpg_print_usage(struct dpg_task *def)
 }
 
 static int
-dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *def,
-		int argc, char **argv)
+dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, int argc, char **argv)
 {
 	int opt, option_index, rps_max;
 	bool Rflag, Eflag;
@@ -1517,7 +1512,7 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 			break;
 
 		case 'h':
-			dpg_print_usage(def);
+			dpg_print_usage();
 			break;
 
 		case 'V':
@@ -2521,7 +2516,7 @@ main(int argc, char **argv)
 	tmpl->pkt_len = DPG_PKT_LEN_MIN;
 
 	while (argc > 1) {
-		rc = dpg_parse_task(&task, tmpl, &tmpl_instance, argc, argv);
+		rc = dpg_parse_task(&task, tmpl, argc, argv);
 
 		argc -= (rc - 1);
 		argv += (rc - 1);
