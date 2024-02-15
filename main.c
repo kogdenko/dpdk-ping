@@ -134,6 +134,25 @@ struct dpg_darray {
 	uint8_t *data;
 };
 
+struct dpg_container {
+	dpg_uint128_t size;
+
+	struct dpg_darray array;
+
+	dpg_uint128_t begin;
+	dpg_uint128_t end;
+
+	dpg_uint128_t (*get)(struct dpg_container *, dpg_uint128_t);
+	int (*find)(struct dpg_container *, dpg_uint128_t);
+};
+
+struct dpg_iterator {
+	dpg_uint128_t current;
+	dpg_uint128_t step;
+
+	struct dpg_container *container;
+};
+
 struct dpg_eth_hdr {
 	dpg_eth_addr_t dst_addr;
 	dpg_eth_addr_t src_addr;
@@ -239,20 +258,6 @@ struct dpg_srv6_hdr {
 	uint8_t localsid[DPG_IPV6_ADDR_SIZE];
 } DPG_PACKED;
 
-struct dpg_container {
-	dpg_uint128_t current;
-	dpg_uint128_t size;
-
-	struct dpg_darray array;
-
-	dpg_uint128_t begin;
-	dpg_uint128_t end;
-
-	dpg_uint128_t (*get)(struct dpg_container *);
-	bool (*iterate)(struct dpg_container *);
-	int (*find)(struct dpg_container *, dpg_uint128_t);
-};
-
 struct dpg_task {
 	struct dpg_dlist llist;
 	struct dpg_dlist plist;
@@ -273,14 +278,21 @@ struct dpg_task {
 	dpg_eth_addr_t dst_eth_addr;
 
 	struct dpg_container src_ip;
+	struct dpg_iterator src_ip_it;
+
 	struct dpg_container dst_ip;
+	struct dpg_iterator dst_ip_it;
 
 	struct dpg_container icmp_id;
+	struct dpg_iterator icmp_id_it;
+
 	struct dpg_container icmp_seq;
+	struct dpg_iterator icmp_seq_it;
 
 	int srv6;
 	uint8_t srv6_src[DPG_IPV6_ADDR_SIZE];
 	struct dpg_container srv6_dst;
+	struct dpg_iterator srv6_dst_it;
 
 	uint16_t pkt_len;
 
@@ -648,25 +660,12 @@ dpg_darray_find(struct dpg_darray *da, void *item)
 }
 
 static dpg_uint128_t
-dpg_iter_array_get(struct dpg_container *c)
+dpg_iter_array_get(struct dpg_container *c, dpg_uint128_t i)
 {
 	dpg_uint128_t *val;
 
-	val = dpg_darray_get(&c->array, c->current);
+	val = dpg_darray_get(&c->array, i);
 	return *val;
-}
-
-static bool
-dpg_iter_array_increment(struct dpg_container *c)
-{
-	assert(c->current < c->array.size);
-	c->current++;
-	if (c->current == c->array.size) {
-		c->current = 0;
-		return true;
-	} else {
-		return false;
-	}
 }
 
 static int
@@ -682,30 +681,17 @@ dpg_iter_array_find(struct dpg_container *c, dpg_uint128_t val)
 static void
 dpg_iter_array_init(struct dpg_container *c)
 {
-	c->current = 0;
 	dpg_darray_init(&c->array, sizeof(dpg_uint128_t));
 
 	c->get = dpg_iter_array_get;
-	c->iterate = dpg_iter_array_increment;
 	c->find = dpg_iter_array_find;
 }
 
 static dpg_uint128_t
-dpg_iter_interval_get(struct dpg_container *c)
+dpg_iter_interval_get(struct dpg_container *c, dpg_uint128_t i)
 {
-	return c->begin + c->current;
-}
-
-static bool
-dpg_iter_interval_increment(struct dpg_container *c)
-{
-	if (c->begin + c->current == c->end) {
-		c->current = 0;
-		return true;
-	} else {
-		c->current++;
-		return false;
-	}
+	assert(i < c->size);
+	return c->begin + i;
 }
 
 static int
@@ -721,37 +707,69 @@ dpg_iter_interval_find(struct dpg_container *c, dpg_uint128_t val)
 static void
 dpg_iter_interval_init(struct dpg_container *c)
 {
-	c->current = 0;
 	c->get = dpg_iter_interval_get;
-	c->iterate = dpg_iter_interval_increment;
 	c->find = dpg_iter_interval_find;
 }
 
 static dpg_uint128_t
-dpg_container_get(struct dpg_container *c)
+dpg_container_get(struct dpg_container *c, dpg_uint128_t i)
 {
 	assert(c->size);
-	return (*c->get)(c);
+	return (*c->get)(c, i);
 }
 
 static bool
-dpg_iter_increment(struct dpg_container *c)
+dpg_iterator_shift(struct dpg_iterator *it, dpg_uint128_t shift)
 {
-	assert(c->size);
-	return (*c->iterate)(c);
+	dpg_uint128_t size;
+	bool overflow;
+
+	size = it->container->size;
+	assert(size);
+
+	overflow = false;
+
+	it->current += shift;
+	while (it->current >= size) {
+		it->current = it->current - size;
+		overflow = true;
+	}
+
+	return overflow;
+}
+
+static void
+dpg_iterator_init(struct dpg_iterator *it, struct dpg_container *c,
+		dpg_uint128_t step, dpg_uint128_t off)
+{
+	it->container = c;
+	it->step = step;
+	it->current = 0;
+
+	dpg_iterator_shift(it, off);
+}
+
+static bool
+dpg_iterator_next(struct dpg_iterator *it)
+{
+	return dpg_iterator_shift(it, it->step);
+}
+
+static dpg_uint128_t
+dpg_iterator_get(struct dpg_iterator *it)
+{
+	return dpg_container_get(it->container, it->current);
 }
 
 static void
 dpg_container_copy(struct dpg_container *dst, struct dpg_container *src)
 {
-	dst->current = src->current;
 	dst->size = src->size;
 
 	dst->begin = src->begin;
 	dst->end = src->end;
 
 	dst->get = src->get;
-	dst->iterate = src->iterate;
 	dst->find = src->find;
 
 	dst->begin = src->begin;
@@ -1645,7 +1663,14 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 		if (task->srv6_dst.size == 0) {
 			dpg_argument_not_specified(0, "srv6-dst");
 		}
+
+		dpg_iterator_init(&task->srv6_dst_it, &task->srv6_dst, 1, 0);
 	}
+
+	dpg_iterator_init(&task->src_ip_it, &task->src_ip, 1, 0);
+	dpg_iterator_init(&task->dst_ip_it, &task->dst_ip, 1, 0);
+	dpg_iterator_init(&task->icmp_id_it, &task->icmp_id, 1, 0);
+	dpg_iterator_init(&task->icmp_seq_it, &task->icmp_seq, 1, 0);
 
 	port = g_dpg_ports + task->port_id;
 	DPG_DLIST_FOREACH(tmp, &port->task_head, plist) {
@@ -1709,7 +1734,7 @@ dpg_create_icmp_request(struct dpg_task *task)
 		srh = (struct dpg_srv6_hdr *)(ih6 + 1);
 		ih = (struct dpg_ipv4_hdr *)(srh + 1);
 
-		srv6_dst = dpg_container_get(&task->srv6_dst);
+		srv6_dst = dpg_iterator_get(&task->srv6_dst_it);
 
 		ih6->vtc_flow = rte_cpu_to_be_32(0x60000000);
 		ih6->payload_len = rte_cpu_to_be_16(m->pkt_len - (sizeof(*eh) + sizeof(*ih6)));
@@ -1727,7 +1752,7 @@ dpg_create_icmp_request(struct dpg_task *task)
 		srh->tag = 0;
 		memcpy(srh->localsid, ih6->dst_addr, DPG_IPV6_ADDR_SIZE);
 
-		overflow = dpg_iter_increment(&task->srv6_dst);
+		overflow = dpg_iterator_next(&task->srv6_dst_it);
 	} else {
 		m->pkt_len = DPG_MAX(task->pkt_len, pkt_len);
 		ih_total_length = m->pkt_len - sizeof(*eh);
@@ -1757,33 +1782,33 @@ dpg_create_icmp_request(struct dpg_task *task)
 	ih->next_proto_id = IPPROTO_ICMP;
 	ih->hdr_checksum = 0;
 
-	src_ip = dpg_container_get(&task->src_ip);
+	src_ip = dpg_iterator_get(&task->src_ip_it);
 	ih->src_addr = rte_cpu_to_be_32(src_ip);
 
-	dst_ip = dpg_container_get(&task->dst_ip);
+	dst_ip = dpg_iterator_get(&task->dst_ip_it);
 	ih->dst_addr = rte_cpu_to_be_32(dst_ip);
 
 	ich->icmp_type = DPG_IP_ICMP_ECHO_REQUEST;
 	ich->icmp_code = 0;
 	ich->icmp_cksum = 0;
 
-	icmp_id = dpg_container_get(&task->icmp_id);
+	icmp_id = dpg_iterator_get(&task->icmp_id_it);
 	ich->icmp_ident = rte_cpu_to_be_16(icmp_id);
 
-	icmp_seq = dpg_container_get(&task->icmp_seq);
+	icmp_seq = dpg_iterator_get(&task->icmp_seq_it);
 	ich->icmp_seq_nb = rte_cpu_to_be_16(icmp_seq);
 
 	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
 	ich->icmp_cksum = dpg_cksum(ich, ih_total_length - sizeof(*ih));
 
 	if (overflow) {
-		overflow = dpg_iter_increment(&task->icmp_id);
+		overflow = dpg_iterator_next(&task->icmp_id_it);
 		if (overflow) {
-			overflow = dpg_iter_increment(&task->src_ip);
+			overflow = dpg_iterator_next(&task->src_ip_it);
 			if (overflow) {
-				overflow = dpg_iter_increment(&task->dst_ip);
+				overflow = dpg_iterator_next(&task->dst_ip_it);
 				if (overflow) {
-					dpg_iter_increment(&task->icmp_seq);
+					dpg_iterator_next(&task->icmp_seq_it);
 				}
 			}
 		}
