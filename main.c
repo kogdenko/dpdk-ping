@@ -243,35 +243,15 @@ struct dpg_srv6_hdr {
 	uint8_t localsid[DPG_IPV6_ADDR_SIZE];
 } DPG_PACKED;
 
-struct dpg_iter_base {
-	void *(*get)(struct dpg_iter_base *);
-	bool (*iterate)(struct dpg_iter_base *);
-	void (*copy)(struct dpg_iter_base *, struct dpg_iter_base *);
-	int (*find)(struct dpg_iter_base *, void *);
-	void (*deinit)(struct dpg_iter_base *);
-};
-
-struct dpg_iter_array {
-	struct dpg_iter_base base;
+struct dpg_container {
+	int size;
+	int current;
 	struct dpg_darray array;
-	int current;
-};
 
-struct dpg_iter_interval {
-	struct dpg_iter_base base;
-
+	void *(*get)(struct dpg_container *);
+	bool (*iterate)(struct dpg_container *);
+	int (*find)(struct dpg_container *, void *);
 	void (*increment)(void *);
-
-	int item_size;
-
-	void *begin;
-	void *end;
-	void *current;
-};
-
-struct dpg_iter {
-	struct dpg_darray children;
-	int current;
 };
 
 struct dpg_task {
@@ -293,20 +273,20 @@ struct dpg_task {
 
 	dpg_eth_addr_t dst_eth_addr;
 
-	struct dpg_iter src_ip;
-	struct dpg_iter dst_ip;
+	struct dpg_container src_ip;
+	struct dpg_container dst_ip;
 
-	struct dpg_iter icmp_id;
-	struct dpg_iter icmp_seq;
+	struct dpg_container icmp_id;
+	struct dpg_container icmp_seq;
 
 	int srv6;
 	struct dpg_ipv6 srv6_src;
-	struct dpg_iter srv6_dst;
+	struct dpg_container srv6_dst;
 
 	uint16_t pkt_len;
 
-	struct dpg_iter addresses4;
-	struct dpg_iter addresses6;
+	struct dpg_container addresses4;
+	struct dpg_container addresses6;
 
 	int tx_bytes;
 	int n_tx_pkts;
@@ -581,20 +561,25 @@ dpg_darray_copy(struct dpg_darray *dst, struct dpg_darray *src)
 	dst->data = dpg_xmemdup(src->data, dst->cap * dst->item_size);
 }
 
+static void
+dpg_darray_resize(struct dpg_darray *da, int size)
+{
+	if (size > da->cap) {
+		da->cap = DPG_MAX(size + 1, 3 * da->cap / 2);
+		da->data = dpg_xrealloc(da->data, da->cap * da->item_size);	
+	}
+	da->size = size;
+}
+
 static void *
 dpg_darray_add(struct dpg_darray *da)
 {
-	if (da->size == da->cap) {
-		da->cap = DPG_MAX(da->size + 1, 3 * da->cap / 2);
-		da->data = dpg_xrealloc(da->data, da->cap * da->item_size);	
-	}
-
-	da->size++;
+	dpg_darray_resize(da, da->size + 1);
 
 	return da->data + (da->size - 1) * da->item_size;
 }
 
-static void *
+/*static void *
 dpg_darray_add2(struct dpg_darray *da, void *item)
 {
 	void *new;
@@ -603,7 +588,7 @@ dpg_darray_add2(struct dpg_darray *da, void *item)
 	memcpy(new, item, da->item_size);
 
 	return new;
-}
+}*/
 
 static void *
 dpg_darray_get(struct dpg_darray *da, size_t i)
@@ -630,140 +615,82 @@ dpg_darray_find(struct dpg_darray *da, void *item)
 }
 
 static void *
-dpg_iter_array_get(struct dpg_iter_base *it_base)
+dpg_iter_array_get(struct dpg_container *c)
 {
-	struct dpg_iter_array *it;
-
-	it = (struct dpg_iter_array *)it_base;
-	return dpg_darray_get(&it->array, it->current);
+	return dpg_darray_get(&c->array, c->current);
 }
 
 static bool
-dpg_iter_array_increment(struct dpg_iter_base *it_base)
+dpg_iter_array_increment(struct dpg_container *c)
 {
-	struct dpg_iter_array *it;
-
-	it = (struct dpg_iter_array *)it_base;
-
-	assert(it->current < it->array.size);
-	it->current++;
-	if (it->current == it->array.size) {
-		it->current = 0;
+	assert(c->current < c->array.size);
+	c->current++;
+	if (c->current == c->array.size) {
+		c->current = 0;
 		return true;
 	} else {
 		return false;
 	}
 }
 
-static void
-dpg_iter_array_copy(struct dpg_iter_base *dst_base, struct dpg_iter_base *src_base)
-{
-	struct dpg_iter_array *dst, *src;
-
-	dst = (struct dpg_iter_array *)dst_base;
-	src = (struct dpg_iter_array *)src_base;
-
-	dst->current = src->current;
-	dpg_darray_copy(&dst->array, &src->array);
-
-	memcpy(dst_base, src_base, sizeof(*dst_base));
-}
-
 static int
-dpg_iter_array_find(struct dpg_iter_base *it_base, void *item)
+dpg_iter_array_find(struct dpg_container *c, void *item)
 {
 	int rc;
-	struct dpg_iter_array *it;
 
-	it = (struct dpg_iter_array *)it_base;
-
-	rc = dpg_darray_find(&it->array, item);
+	rc = dpg_darray_find(&c->array, item);
 
 	return rc < 0 ? rc : 0;
 }
 
 static void
-dpg_iter_array_deinit(struct dpg_iter_base *it_base)
+dpg_iter_array_init(struct dpg_container *c, int item_size)
 {
-	struct dpg_iter_array *it;
+	c->current = 0;
+	dpg_darray_init(&c->array, item_size);
 
-	it = (struct dpg_iter_array *)it_base;
-
-	dpg_darray_deinit(&it->array);
-}
-
-static void
-dpg_iter_array_init(struct dpg_iter_array *it, int item_size)
-{
-	it->current = 0;
-	dpg_darray_init(&it->array, item_size);
-
-	it->base.get = dpg_iter_array_get;
-	it->base.iterate = dpg_iter_array_increment;
-	it->base.copy = dpg_iter_array_copy;
-	it->base.find = dpg_iter_array_find;
-	it->base.deinit = dpg_iter_array_deinit;
+	c->get = dpg_iter_array_get;
+	c->iterate = dpg_iter_array_increment;
+	c->find = dpg_iter_array_find;
 }
 
 static void *
-dpg_iter_interval_get(struct dpg_iter_base *it_base)
+dpg_iter_interval_get(struct dpg_container *c)
 {
-	struct dpg_iter_interval *it;
-
-	it = (struct dpg_iter_interval *)it_base;
-
-	return it->current;
+	return dpg_darray_get(&c->array, 2);
 }
 
 static bool
-dpg_iter_interval_increment(struct dpg_iter_base *it_base)
+dpg_iter_interval_increment(struct dpg_container *c)
 {
 	int cmp;
-	struct dpg_iter_interval *it;
+	void *begin, *end, *current;
 
-	it = (struct dpg_iter_interval *)it_base;
-	cmp = memcmp(it->current, it->end, it->item_size);
+	begin = dpg_darray_get(&c->array, 0);
+	end = dpg_darray_get(&c->array, 1);
+	current = dpg_darray_get(&c->array, 2);
+
+	cmp = memcmp(current, end, c->array.item_size);
 	assert(cmp <= 0);
 	if (cmp == 0) {
-		memcpy(it->current, it->begin, it->item_size);
+		memcpy(current, begin, c->array.item_size);
 		return true;
 	} else {
-		(*it->increment)(it->current);
+		(*c->increment)(current);
 		return false;
 	}
 }
 
-static void
-dpg_iter_interval_copy(struct dpg_iter_base *dst_base, struct dpg_iter_base *src_base)
-{
-	struct dpg_iter_interval *dst, *src;
-
-	dst = (struct dpg_iter_interval *)dst_base;
-	src = (struct dpg_iter_interval *)src_base;
-
-	free(dst->current);
-	free(dst->begin);
-	free(dst->end);
-
-	dst->item_size = src->item_size;
-	dst->increment = src->increment;
-
-	dst->current = dpg_xmemdup(src->current, dst->item_size);
-	dst->begin = dpg_xmemdup(src->begin, dst->item_size);
-	dst->end = dpg_xmemdup(src->end, dst->item_size);
-
-	memcpy(dst_base, src_base, sizeof(*dst_base));
-}
-
 static int
-dpg_iter_interval_find(struct dpg_iter_base *it_base, void *item)
+dpg_iter_interval_find(struct dpg_container *c, void *item)
 {
-	struct dpg_iter_interval *it;
+	void *begin, *end;
 
-	it = (struct dpg_iter_interval *)it_base;
+	begin = dpg_darray_get(&c->array, 0);
+	end = dpg_darray_get(&c->array, 1);
 
-	if (memcmp(item, it->begin, it->item_size) >= 0 &&
-			memcmp(item, it->end, it->item_size) <= 0) {
+	if (memcmp(item, begin, c->array.item_size) >= 0 &&
+			memcmp(item, end, c->array.item_size) <= 0) {
 		return 0;
 	} else {
 		return -ESRCH;
@@ -771,200 +698,112 @@ dpg_iter_interval_find(struct dpg_iter_base *it_base, void *item)
 }
 
 static void
-dpg_iter_interval_deinit(struct dpg_iter_base *it_base)
+dpg_iter_interval_init(struct dpg_container *c, int item_size, void (*increment)(void *))
 {
-	struct dpg_iter_interval *it;
+	dpg_darray_init(&c->array, item_size);
+	dpg_darray_resize(&c->array, 3);
 
-	it = (struct dpg_iter_interval *)it_base;
-	free(it->begin);
-	it->begin = NULL;
-
-	free(it->end);
-	it->end = NULL;
-
-	free(it->current);
-	it->current = NULL;
-}
-
-static void
-dpg_iter_interval_init(struct dpg_iter_interval *it, int item_size, void (*increment)(void *))
-{
-	it->item_size = item_size;
-	it->increment = increment;
-
-	it->begin = dpg_xmalloc(item_size);
-	it->end = dpg_xmalloc(item_size);
-	it->current = dpg_xmalloc(item_size);
-
-	it->base.get = dpg_iter_interval_get;
-	it->base.iterate = dpg_iter_interval_increment;
-	it->base.copy = dpg_iter_interval_copy;
-	it->base.find = dpg_iter_interval_find;
-	it->base.deinit = dpg_iter_interval_deinit;
+	c->increment = increment;
+	c->get = dpg_iter_interval_get;
+	c->iterate = dpg_iter_interval_increment;
+	c->find = dpg_iter_interval_find;
 }
 
 static void *
-dpg_iter_get(struct dpg_iter *it)
+dpg_container_get(struct dpg_container *c)
 {
-	struct dpg_iter_base *cur;
-
-	cur = dpg_darray_get(&it->children, it->current);
-
-	return (*cur->get)(cur);
+	assert(c->size);
+	return (*c->get)(c);
 }
 
 static bool
-dpg_iter_increment(struct dpg_iter *it)
+dpg_iter_increment(struct dpg_container *c)
 {
-	bool overflow;
-	struct dpg_iter_base *cur;
-
-	cur = dpg_darray_get(&it->children, it->current);
-	overflow = (*cur->iterate)(cur);
-	if (overflow) {
-		it->current++;
-		if (it->current == it->children.size) {
-			it->current = 0;
-			return true;
-		} else {
-			return false;
-		}
-	} else {
-		return false;
-	}
+	assert(c->size);
+	return (*c->iterate)(c);
 }
 
 static void
-dpg_iter_copy(struct dpg_iter *dst, struct dpg_iter *src)
+dpg_container_copy(struct dpg_container *dst, struct dpg_container *src)
 {
-	int i;
-	struct dpg_iter_base *dst_child, *src_child;
-
-	dpg_darray_deinit(&dst->children);
-	dpg_darray_init(&dst->children, src->children.item_size);
-
-	for (i = 0; i < src->children.size; ++i) {
-		src_child = dpg_darray_get(&src->children, i);
-		dst_child = dpg_darray_add(&dst->children);
-		memset(dst_child, 0, dst->children.item_size);
-		(*src_child->copy)(dst_child, src_child);
-	}
-}
-
-static void
-dpg_iter_init(struct dpg_iter *it)
-{
-	int max_it_size;
-
-	max_it_size = DPG_MAX(sizeof(struct dpg_iter_interval),	sizeof(struct dpg_iter_array));
-
-	dpg_darray_init(&it->children, max_it_size);
-	it->current = 0;
+	dst->increment = src->increment;
+	memcpy(dst, src, sizeof(*dst));
+	dpg_darray_copy(&dst->array, &src->array);
 }
 
 static int
-dpg_iter_find(struct dpg_iter *it, void *item)
+dpg_container_find(struct dpg_container *c, void *item)
 {
-	int i, rc;
-	struct dpg_iter_base *child;
-
-	for (i = 0; i < it->children.size; ++i) {
-		child = dpg_darray_get(&it->children, i);
-		rc = (*child->find)(child, item);
-		if (rc == 0) {
-			return 0;
-		}
-	}
-
-	return -ESRCH;
-}
-
-static void
-dpg_iter_clean(struct dpg_iter *it)
-{
-	int i;
-	struct dpg_iter_base *child;
-
-	for (i = 0; i < it->children.size; ++i) {
-		child = dpg_darray_get(&it->children, i);
-		(*child->deinit)(child);
-	}
-
-	it->current = 0;
-	it->children.size = 0;
+	return (*c->find)(c, item);
 }
 
 static bool
-dpg_iter_empty(struct dpg_iter *it)
+dpg_container_is_empty(struct dpg_container *c)
 {
-	return it->children.size == 0;
+	return c->size == 0;
+}
+
+static void
+dpg_container_deinit(struct dpg_container *c)
+{
+	dpg_darray_deinit(&c->array);
+	c->size = 0;
 }
 
 static int
-dpg_iter_parse(char *str, struct dpg_iter *it, int item_size,
+dpg_container_parse(char *str, struct dpg_container *c, int item_size,
 		int (*parse)(char *, void *), void (*increment)(void *))
 {
 	int rc;
-	void *item;
+	void *begin, *end, *current;
 	char *s, *d;
-	struct dpg_iter_array a;
-	struct dpg_iter_interval i;
 
-	dpg_iter_clean(it);
+	d = strchr(str, '-');
+	if (d == NULL) {
+		dpg_iter_array_init(c, item_size);
 
-	dpg_iter_array_init(&a, item_size);
-	dpg_iter_interval_init(&i, item_size, increment);
-
-	for (s = strtok(str, ","); s != NULL; s = strtok(NULL, ",")) {
-		d = strchr(s, '-');
-		if (d == NULL) {
-			item = dpg_darray_add(&a.array);
-			rc = (*parse)(s, item);
+		for (s = strtok(str, ","); s != NULL; s = strtok(NULL, ",")) {
+			current = dpg_darray_add(&c->array);
+			rc = (*parse)(s, current);
 			if (rc < 0) {
 				goto err;
-			}
-		} else {
-			*d = '\0';
-			if (a.array.size) {
-				dpg_darray_add2(&it->children, &a);
-				dpg_iter_array_init(&a, item_size);
-			}
-			rc = (*parse)(s, i.begin);
-			if (rc < 0) {
-				goto err;
-			}
-			rc = (*parse)(d + 1, i.end);
-			if (rc < 0) {
-				goto err;
-			}
-			*d = '-';
-
-			rc = memcmp(i.begin, i.end, item_size);
-			if (rc > 0) {
-				rc = -EINVAL;
-				goto err;
-			}
-
-			memcpy(i.current, i.begin, item_size);
-
-			dpg_darray_add2(&it->children, &i);
-			dpg_iter_interval_init(&i, item_size, increment);
+			}	
 		}
+
+		c->size = c->array.size;
+	} else {
+		*d = '\0';
+
+		dpg_iter_interval_init(c, item_size, increment);
+		begin = dpg_darray_get(&c->array, 0);
+		end = dpg_darray_get(&c->array, 1);
+		current = dpg_darray_get(&c->array, 2);
+
+		rc = (*parse)(str, begin);
+		if (rc < 0) {
+			goto err;
+		}
+		rc = (*parse)(d + 1, end);
+		if (rc < 0) {
+			goto err;
+		}
+		*d = '-';
+
+		rc = memcmp(begin, end, item_size);
+		if (rc > 0) {
+			rc = -EINVAL;
+			goto err;
+		}
+
+		memcpy(current, begin, item_size);
+
+		c->size = 1;
 	}
 
-	if (a.array.size) {
-		dpg_darray_add2(&it->children, &a);
-	}
-	dpg_iter_interval_deinit(&i.base);
-	if (it->children.size == 0) {
-		return -EINVAL;
-	} else {
-		return 0;
-	}
+	return 0;
 
 err:
-	dpg_iter_array_deinit(&a.base);
-	dpg_iter_interval_deinit(&i.base);
+	dpg_container_deinit(c);
 	return rc;
 }
 
@@ -1419,32 +1258,34 @@ dpg_port_is_configured(struct dpg_port *port)
 }
 
 static int
-dpg_iter_parse_u16(char *str, struct dpg_iter *it)
+dpg_container_parse_u16(char *str, struct dpg_container *c)
 {
 	int rc;
 
-	rc = dpg_iter_parse(str, it, sizeof(uint32_t), dpg_parse_u16, dpg_increment_u16);
+	rc = dpg_container_parse(str, c, sizeof(uint32_t),
+			dpg_parse_u16, dpg_increment_u16);
 
 	return rc;
 }
 
 static int
-dpg_iter_parse_ipv4(char *str, struct dpg_iter *it)
+dpg_container_parse_ipv4(char *str, struct dpg_container *c)
 {
 	int rc;
 
-	rc = dpg_iter_parse(str, it, sizeof(uint32_t), dpg_parse_ipv4, dpg_increment_u32);
+	rc = dpg_container_parse(str, c, sizeof(uint32_t),
+			dpg_parse_ipv4, dpg_increment_u32);
 
 	return rc;
 }
 
 static int
-dpg_iter_parse_ipv6(char *str, struct dpg_iter *it)
+dpg_container_parse_ipv6(char *str, struct dpg_container *c)
 {
 	int rc;
 
-	rc = dpg_iter_parse(str, it, sizeof(struct dpg_ipv6), dpg_parse_ipv6,
-			dpg_increment_ipv6);
+	rc = dpg_container_parse(str, c, sizeof(struct dpg_ipv6),
+			dpg_parse_ipv6,	dpg_increment_ipv6);
 
 	return rc;
 }
@@ -1460,21 +1301,21 @@ dpg_task_copy(struct dpg_task *dst, struct dpg_task *src)
 	dst->lcore_id = src->lcore_id;
 	dst->dst_eth_addr = src->dst_eth_addr;
 
-	dpg_iter_copy(&dst->src_ip, &src->src_ip);
-	dpg_iter_copy(&dst->dst_ip, &src->dst_ip);
+	dpg_container_copy(&dst->src_ip, &src->src_ip);
+	dpg_container_copy(&dst->dst_ip, &src->dst_ip);
 
-	dpg_iter_copy(&dst->icmp_id, &src->icmp_id);
-	dpg_iter_copy(&dst->icmp_seq, &src->icmp_seq);
+	dpg_container_copy(&dst->icmp_id, &src->icmp_id);
+	dpg_container_copy(&dst->icmp_seq, &src->icmp_seq);
 
 	dst->srv6 = src->srv6;
 	dst->srv6_src = src->srv6_src;
 
-	dpg_iter_copy(&dst->srv6_dst, &src->srv6_dst);
+	dpg_container_copy(&dst->srv6_dst, &src->srv6_dst);
 
 	dst->pkt_len = src->pkt_len;
 
-	dpg_iter_copy(&dst->addresses4, &src->addresses4);
-	dpg_iter_copy(&dst->addresses6, &src->addresses6);
+	dpg_container_copy(&dst->addresses4, &src->addresses4);
+	dpg_container_copy(&dst->addresses6, &src->addresses6);
 }
 
 static void
@@ -1600,12 +1441,12 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 			} else if (!strcmp(optname, "tx-verbose")) {
 				task->verbose[DPG_TX] = strtoul(optarg, NULL, 10);
 			} else if (!strcmp(optname, "icmp-id")) {
-				rc = dpg_iter_parse_u16(optarg, &task->icmp_id);
+				rc = dpg_container_parse_u16(optarg, &task->icmp_id);
 				if (rc < 0) {
 					dpg_invalid_argument(0, optname);
 				}
 			} else if (!strcmp(optname, "icmp-seq")) {
-				rc = dpg_iter_parse_u16(optarg, &task->icmp_seq);
+				rc = dpg_container_parse_u16(optarg, &task->icmp_seq);
 				if (rc < 0) {
 					dpg_invalid_argument(0, optname);
 				}
@@ -1616,7 +1457,7 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 				}
 				task->srv6 = 1;
 			} else if (!strcmp(optname, "srv6-dst")) {
-				rc = dpg_iter_parse_ipv6(optarg, &task->srv6_dst);
+				rc = dpg_container_parse_ipv6(optarg, &task->srv6_dst);
 				if (rc < 0) {
 					dpg_invalid_argument(0, optname);
 				}
@@ -1714,14 +1555,14 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 			break;
 
 		case '4':
-			rc = dpg_iter_parse_ipv4(optarg, &task->addresses4);
+			rc = dpg_container_parse_ipv4(optarg, &task->addresses4);
 			if (rc < 0) {
 				dpg_invalid_argument(opt, NULL);
 			}
 			break;
 
 		case '6':
-			rc = dpg_iter_parse_ipv6(optarg, &task->addresses6);
+			rc = dpg_container_parse_ipv6(optarg, &task->addresses6);
 			if (rc < 0) {
 				dpg_invalid_argument(opt, NULL);
 			}
@@ -1743,14 +1584,14 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 			break;
 
 		case 's':
-			rc = dpg_iter_parse_ipv4(optarg, &task->src_ip);
+			rc = dpg_container_parse_ipv4(optarg, &task->src_ip);
 			if (rc < 0) {
 				dpg_invalid_argument(opt, NULL);
 			}
 			break;
 
 		case 'd':
-			rc = dpg_iter_parse_ipv4(optarg, &task->dst_ip);
+			rc = dpg_container_parse_ipv4(optarg, &task->dst_ip);
 			if (rc < 0) {
 				dpg_invalid_argument(opt, NULL);
 			}
@@ -1796,7 +1637,7 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 		if (dpg_ipv6_iszero(&task->srv6_src)) {
 			dpg_argument_not_specified(0, "srv6-src");
 		}
-		if (dpg_iter_empty(&task->srv6_dst)) {
+		if (dpg_container_is_empty(&task->srv6_dst)) {
 			dpg_argument_not_specified(0, "srv6-dst");
 		}
 	}
@@ -1865,7 +1706,7 @@ dpg_create_icmp_request(struct dpg_task *task)
 		srh = (struct dpg_srv6_hdr *)(ih6 + 1);
 		ih = (struct dpg_ipv4_hdr *)(srh + 1);
 
-		srv6_dst = dpg_iter_get(&task->srv6_dst);
+		srv6_dst = dpg_container_get(&task->srv6_dst);
 
 		ih6->vtc_flow = rte_cpu_to_be_32(0x60000000);
 		ih6->payload_len = rte_cpu_to_be_16(m->pkt_len - (sizeof(*eh) + sizeof(*ih6)));
@@ -1913,20 +1754,20 @@ dpg_create_icmp_request(struct dpg_task *task)
 	ih->next_proto_id = IPPROTO_ICMP;
 	ih->hdr_checksum = 0;
 
-	src_ip = dpg_iter_get(&task->src_ip);
+	src_ip = dpg_container_get(&task->src_ip);
 	ih->src_addr = rte_cpu_to_be_32(*src_ip);
 
-	dst_ip = dpg_iter_get(&task->dst_ip);
+	dst_ip = dpg_container_get(&task->dst_ip);
 	ih->dst_addr = rte_cpu_to_be_32(*dst_ip);
 
 	ich->icmp_type = DPG_IP_ICMP_ECHO_REQUEST;
 	ich->icmp_code = 0;
 	ich->icmp_cksum = 0;
 
-	icmp_id = dpg_iter_get(&task->icmp_id);
+	icmp_id = dpg_container_get(&task->icmp_id);
 	ich->icmp_ident = rte_cpu_to_be_16(*icmp_id);
 
-	icmp_seq = dpg_iter_get(&task->icmp_seq);
+	icmp_seq = dpg_container_get(&task->icmp_seq);
 	ich->icmp_seq_nb = rte_cpu_to_be_16(*icmp_seq);
 
 	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
@@ -2118,7 +1959,7 @@ dpg_ipv6_input(struct dpg_task *task, struct rte_mbuf *m)
 				dpg_log_ipv6(task, DPG_RX, eh, ih6, desc);
 			}
 
-			rc = dpg_iter_find(&task->addresses6, &ns->target);
+			rc = dpg_container_find(&task->addresses6, &ns->target);
 			if (rc < 0) {
 				return -EINVAL;
 			}
@@ -2636,22 +2477,10 @@ main(int argc, char **argv)
 		tmpl->dst_eth_addr.addr_bytes[i] = 0xFF;
 	}
 
-	dpg_iter_init(&tmpl->src_ip);
-	dpg_iter_parse_ipv4(DPG_SRC_IP_DEFAULT, &tmpl->src_ip);
-
-	dpg_iter_init(&tmpl->dst_ip);
-	dpg_iter_parse_ipv4(DPG_DST_IP_DEFAULT, &tmpl->dst_ip);
-
-	dpg_iter_init(&tmpl->icmp_id);
-	dpg_iter_parse_u16(DPG_ICMP_ID_DEFAULT, &tmpl->icmp_id);
-
-	dpg_iter_init(&tmpl->icmp_seq);
-	dpg_iter_parse_u16(DPG_ICMP_SEQ_DEFAULT, &tmpl->icmp_seq);
-
-	dpg_iter_init(&tmpl->srv6_dst);
-
-	dpg_iter_init(&tmpl->addresses4);
-	dpg_iter_init(&tmpl->addresses6);
+	dpg_container_parse_ipv4(DPG_SRC_IP_DEFAULT, &tmpl->src_ip);
+	dpg_container_parse_ipv4(DPG_DST_IP_DEFAULT, &tmpl->dst_ip);
+	dpg_container_parse_u16(DPG_ICMP_ID_DEFAULT, &tmpl->icmp_id);
+	dpg_container_parse_u16(DPG_ICMP_SEQ_DEFAULT, &tmpl->icmp_seq);
 
 	tmpl->pkt_len = DPG_PKT_LEN_MIN;
 
