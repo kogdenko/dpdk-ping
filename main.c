@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <assert.h>
+#include <ctype.h>
 #include <getopt.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -109,6 +110,8 @@ typedef struct rte_ether_addr dpg_eth_addr_t;
 #define dpg_dev_name(dev) rte_dev_name(dev)
 #endif
 
+typedef unsigned __int128 dpg_uint128_t;
+
 struct dpg_dlist {
 	struct dpg_dlist *dls_next;
 	struct dpg_dlist *dls_prev;
@@ -129,13 +132,6 @@ struct dpg_darray {
 	size_t cap;
 	size_t item_size;
 	uint8_t *data;
-};
-
-struct dpg_ipv6 {
-	union {
-		uint8_t as_bytes[16];
-		uint64_t as_u64[2];
-	};
 };
 
 struct dpg_eth_hdr {
@@ -244,14 +240,17 @@ struct dpg_srv6_hdr {
 } DPG_PACKED;
 
 struct dpg_container {
-	int size;
-	int current;
+	dpg_uint128_t current;
+	dpg_uint128_t size;
+
 	struct dpg_darray array;
 
-	void *(*get)(struct dpg_container *);
+	dpg_uint128_t begin;
+	dpg_uint128_t end;
+
+	dpg_uint128_t (*get)(struct dpg_container *);
 	bool (*iterate)(struct dpg_container *);
-	int (*find)(struct dpg_container *, void *);
-	void (*increment)(void *);
+	int (*find)(struct dpg_container *, dpg_uint128_t);
 };
 
 struct dpg_task {
@@ -280,7 +279,7 @@ struct dpg_task {
 	struct dpg_container icmp_seq;
 
 	int srv6;
-	struct dpg_ipv6 srv6_src;
+	uint8_t srv6_src[DPG_IPV6_ADDR_SIZE];
 	struct dpg_container srv6_dst;
 
 	uint16_t pkt_len;
@@ -362,6 +361,44 @@ static u_int g_dpg_no_drop_seq = 10;
 #define dpg_die(...) \
 	rte_exit(EXIT_FAILURE, ##__VA_ARGS__);
 
+#define dpg_dbg(f, ...) do { \
+	printf("%u: ", __LINE__); \
+	printf(f, ##__VA_ARGS__); \
+	printf("\n"); \
+} while (0)
+
+static void dpg_print_hexdump_ascii(const void *data, int count)
+	__attribute__((unused));
+
+static void
+dpg_print_hexdump_ascii(const void *data, int count)
+{
+	int i, j, k, savei;
+	u_char ch;
+
+	for (i = 0; i < count;) {
+		savei = i;
+		for (j = 0; j < 8; ++j) {
+			for (k = 0; k < 2; ++k) {
+				if (i < count) {
+					ch = ((const u_char *)data)[i];
+					printf("%02hhx", ch);
+					i++;
+				} else {
+					printf("  ");
+				}
+			}
+			printf(" ");
+		}
+		printf(" ");
+		for (j = savei; j < i; ++j) {
+			ch = ((const u_char *)data)[j];
+			printf("%c", isprint(ch) ? ch : '.');
+		}
+		printf("\n");
+	}
+}
+
 static void *
 dpg_xmalloc(size_t size)
 {
@@ -396,8 +433,8 @@ dpg_xmemdup(void *ptr, int size)
 	return cp;
 }
 
-static int
-dpg_memcmpz(const void *ptr, size_t n)
+static bool
+dpg_is_zero(const void *ptr, size_t n)
 {
 	uint8_t rc;
 	size_t i;
@@ -405,10 +442,11 @@ dpg_memcmpz(const void *ptr, size_t n)
 	for (i = 0; i < n; ++i) {
 		rc = ((const uint8_t *)ptr)[i];
 		if (rc) {
-			return rc;
+			return false;
 		}
 	}
-	return 0;
+
+	return true;
 }
 
 static void
@@ -464,12 +502,6 @@ dpg_counter_get(struct dpg_counter *c)
 	}
 
 	return sum;
-}
-
-static int
-dpg_ipv6_iszero(struct dpg_ipv6 *a)
-{
-	return !dpg_memcmpz(a->as_bytes, sizeof(a));
 }
 
 static void
@@ -558,6 +590,7 @@ dpg_darray_copy(struct dpg_darray *dst, struct dpg_darray *src)
 	dst->item_size = src->item_size;
 
 	free(dst->data);
+	
 	dst->data = dpg_xmemdup(src->data, dst->cap * dst->item_size);
 }
 
@@ -614,10 +647,13 @@ dpg_darray_find(struct dpg_darray *da, void *item)
 	return -ESRCH;
 }
 
-static void *
+static dpg_uint128_t
 dpg_iter_array_get(struct dpg_container *c)
 {
-	return dpg_darray_get(&c->array, c->current);
+	dpg_uint128_t *val;
+
+	val = dpg_darray_get(&c->array, c->current);
+	return *val;
 }
 
 static bool
@@ -634,63 +670,48 @@ dpg_iter_array_increment(struct dpg_container *c)
 }
 
 static int
-dpg_iter_array_find(struct dpg_container *c, void *item)
+dpg_iter_array_find(struct dpg_container *c, dpg_uint128_t val)
 {
 	int rc;
 
-	rc = dpg_darray_find(&c->array, item);
+	rc = dpg_darray_find(&c->array, &val);
 
 	return rc < 0 ? rc : 0;
 }
 
 static void
-dpg_iter_array_init(struct dpg_container *c, int item_size)
+dpg_iter_array_init(struct dpg_container *c)
 {
 	c->current = 0;
-	dpg_darray_init(&c->array, item_size);
+	dpg_darray_init(&c->array, sizeof(dpg_uint128_t));
 
 	c->get = dpg_iter_array_get;
 	c->iterate = dpg_iter_array_increment;
 	c->find = dpg_iter_array_find;
 }
 
-static void *
+static dpg_uint128_t
 dpg_iter_interval_get(struct dpg_container *c)
 {
-	return dpg_darray_get(&c->array, 2);
+	return c->begin + c->current;
 }
 
 static bool
 dpg_iter_interval_increment(struct dpg_container *c)
 {
-	int cmp;
-	void *begin, *end, *current;
-
-	begin = dpg_darray_get(&c->array, 0);
-	end = dpg_darray_get(&c->array, 1);
-	current = dpg_darray_get(&c->array, 2);
-
-	cmp = memcmp(current, end, c->array.item_size);
-	assert(cmp <= 0);
-	if (cmp == 0) {
-		memcpy(current, begin, c->array.item_size);
+	if (c->begin + c->current == c->end) {
+		c->current = 0;
 		return true;
 	} else {
-		(*c->increment)(current);
+		c->current++;
 		return false;
 	}
 }
 
 static int
-dpg_iter_interval_find(struct dpg_container *c, void *item)
+dpg_iter_interval_find(struct dpg_container *c, dpg_uint128_t val)
 {
-	void *begin, *end;
-
-	begin = dpg_darray_get(&c->array, 0);
-	end = dpg_darray_get(&c->array, 1);
-
-	if (memcmp(item, begin, c->array.item_size) >= 0 &&
-			memcmp(item, end, c->array.item_size) <= 0) {
+	if (val >= c->begin && val <= c->end) {
 		return 0;
 	} else {
 		return -ESRCH;
@@ -698,18 +719,15 @@ dpg_iter_interval_find(struct dpg_container *c, void *item)
 }
 
 static void
-dpg_iter_interval_init(struct dpg_container *c, int item_size, void (*increment)(void *))
+dpg_iter_interval_init(struct dpg_container *c)
 {
-	dpg_darray_init(&c->array, item_size);
-	dpg_darray_resize(&c->array, 3);
-
-	c->increment = increment;
+	c->current = 0;
 	c->get = dpg_iter_interval_get;
 	c->iterate = dpg_iter_interval_increment;
 	c->find = dpg_iter_interval_find;
 }
 
-static void *
+static dpg_uint128_t
 dpg_container_get(struct dpg_container *c)
 {
 	assert(c->size);
@@ -726,21 +744,24 @@ dpg_iter_increment(struct dpg_container *c)
 static void
 dpg_container_copy(struct dpg_container *dst, struct dpg_container *src)
 {
-	dst->increment = src->increment;
-	memcpy(dst, src, sizeof(*dst));
+	dst->current = src->current;
+	dst->size = src->size;
+
+	dst->begin = src->begin;
+	dst->end = src->end;
+
+	dst->get = src->get;
+	dst->iterate = src->iterate;
+	dst->find = src->find;
+
+	dst->begin = src->begin;
 	dpg_darray_copy(&dst->array, &src->array);
 }
 
 static int
-dpg_container_find(struct dpg_container *c, void *item)
+dpg_container_find(struct dpg_container *c, dpg_uint128_t val)
 {
-	return (*c->find)(c, item);
-}
-
-static bool
-dpg_container_is_empty(struct dpg_container *c)
-{
-	return c->size == 0;
+	return (*c->find)(c, val);
 }
 
 static void
@@ -751,53 +772,46 @@ dpg_container_deinit(struct dpg_container *c)
 }
 
 static int
-dpg_container_parse(char *str, struct dpg_container *c, int item_size,
-		int (*parse)(char *, void *), void (*increment)(void *))
+dpg_container_parse(char *str, struct dpg_container *c, int (*parse)(char *, dpg_uint128_t *))
 {
 	int rc;
-	void *begin, *end, *current;
+	dpg_uint128_t *val;
 	char *s, *d;
 
 	d = strchr(str, '-');
 	if (d == NULL) {
-		dpg_iter_array_init(c, item_size);
+		dpg_iter_array_init(c);
 
 		for (s = strtok(str, ","); s != NULL; s = strtok(NULL, ",")) {
-			current = dpg_darray_add(&c->array);
-			rc = (*parse)(s, current);
+			val = dpg_darray_add(&c->array);
+			rc = (*parse)(s, val);
 			if (rc < 0) {
 				goto err;
-			}	
+			}
 		}
 
 		c->size = c->array.size;
 	} else {
 		*d = '\0';
 
-		dpg_iter_interval_init(c, item_size, increment);
-		begin = dpg_darray_get(&c->array, 0);
-		end = dpg_darray_get(&c->array, 1);
-		current = dpg_darray_get(&c->array, 2);
+		dpg_iter_interval_init(c);
 
-		rc = (*parse)(str, begin);
+		rc = (*parse)(str, &c->begin);
 		if (rc < 0) {
 			goto err;
 		}
-		rc = (*parse)(d + 1, end);
+		rc = (*parse)(d + 1, &c->end);
 		if (rc < 0) {
 			goto err;
 		}
 		*d = '-';
-
-		rc = memcmp(begin, end, item_size);
-		if (rc > 0) {
+	
+		if (c->begin > c->end) {
 			rc = -EINVAL;
 			goto err;
 		}
 
-		memcpy(current, begin, item_size);
-
-		c->size = 1;
+		c->size = c->end - c->begin + 1;
 	}
 
 	return 0;
@@ -807,34 +821,6 @@ err:
 	return rc;
 }
 
-static void
-dpg_increment_u16(void *p)
-{
-	(*((uint32_t *)p))++;
-}
-
-static void
-dpg_increment_u32(void *p)
-{
-	(*((uint32_t *)p))++;
-}
-
-static void
-dpg_increment_ipv6(void *p)
-{
-	int i;
-	struct dpg_ipv6 *a;
-
-	a = p;
-
-	for (i = DPG_ARRAY_SIZE(a->as_bytes) - 1; i >= 0; --i) {
-		a->as_bytes[i]++;
-		if (a->as_bytes[i]) {
-			break;
-		}
-	}
-}
-
 static const char *
 dpg_bool_str(int b)
 {
@@ -842,13 +828,10 @@ dpg_bool_str(int b)
 }
 
 static int
-dpg_parse_bool(char *str, void *res)
+dpg_parse_bool(char *str, bool *pb)
 {
 	int b;
-	bool *pb;
 	char *endptr;
-
-	pb = res;
 
 	b = strtoul(str, &endptr, 10);
 	if (*endptr == '\0') {
@@ -871,49 +854,64 @@ dpg_parse_bool(char *str, void *res)
 }
 
 static int
-dpg_parse_u16(char *str, void *res)
+dpg_parse_u16(char *str, dpg_uint128_t *res)
 {
 	u_long ul;
 	char *endptr;
-	uint16_t *pu16;
-
-	pu16 = res;
 
 	ul = strtoul(str, &endptr, 10);
 	if (*endptr != '\0' || ul > UINT16_MAX) {
 		return -EINVAL;
 	} else {
-		*pu16 = ul;
+		*res = ul;
 		return 0;
 	}
-
 }
 
 static int
-dpg_parse_ipv4(char *str, void *res)
+dpg_parse_ipv4(char *str, dpg_uint128_t *res)
 {
 	int rc;
-	uint32_t *a;
 	struct in_addr tmp;
-
-	a = res;
 
 	rc = inet_pton(AF_INET, str, &tmp);
 	if (rc == 1) {
-		*a = rte_be_to_cpu_32(tmp.s_addr);
+		*res = rte_be_to_cpu_32(tmp.s_addr);
 		return 0;
 	} else {
 		return -EINVAL;
 	}
 }
 
+#if RTE_BYTE_ORDER == RTE_BIG_ENDIAN
+#define dpg_hton128(x) (x)
+#define dpg_ntoh128(x) (x)
+#else
+static dpg_uint128_t
+dpg_swap128(dpg_uint128_t src)
+{
+	int i;
+	dpg_uint128_t dst;
+
+	for (i = 0; i < sizeof(dst); ++i) {
+		((uint8_t *)&dst)[i] = ((uint8_t *)&src)[sizeof(dst) - 1 - i];
+	}
+
+	return dst;
+}
+#define dpg_hton128(x) dpg_swap128(x)
+#define dpg_ntoh128(x) dpg_swap128(x)
+#endif
+
 static int
-dpg_parse_ipv6(char *str, void *a)
+dpg_ipv6_parse(char *str, dpg_uint128_t *res)
 {
 	int rc;
+	dpg_uint128_t addr;
 
-	rc = inet_pton(AF_INET6, str, a);
+	rc = inet_pton(AF_INET6, str, &addr);
 	if (rc == 1) {
+		*res = dpg_ntoh128(addr);
 		return 0;
 	} else {
 		return -EINVAL;
@@ -921,9 +919,20 @@ dpg_parse_ipv6(char *str, void *a)
 }
 
 static void
-dpg_ipv6_hton(uint8_t *dst, struct dpg_ipv6 *a)
+dpg_uint128_to_ipv6(uint8_t *ipv6, dpg_uint128_t u)
 {
-	memcpy(dst, a->as_bytes, DPG_IPV6_ADDR_SIZE);
+	u = dpg_hton128(u);
+	memcpy(ipv6, &u, DPG_IPV6_ADDR_SIZE);
+}
+
+static dpg_uint128_t
+dpg_ipv6_to_uint128(uint8_t  *ipv6)
+{
+	dpg_uint128_t u;
+
+	memcpy(&u, ipv6, DPG_IPV6_ADDR_SIZE);
+	u = dpg_ntoh128(u);
+	return u;
 }
 
 static int
@@ -932,8 +941,8 @@ dpg_eth_unformat_addr(const char *str, dpg_eth_addr_t *a)
 	int rc;
 
 	rc = sscanf(str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-			(a)->addr_bytes + 0, a->addr_bytes + 1, a->addr_bytes + 2,
-			(a)->addr_bytes + 3, a->addr_bytes + 4, a->addr_bytes + 5);
+			a->addr_bytes + 0, a->addr_bytes + 1, a->addr_bytes + 2,
+			a->addr_bytes + 3, a->addr_bytes + 4, a->addr_bytes + 5);
 
 	return rc == 6 ? 0 : -EINVAL;
 }
@@ -1262,8 +1271,7 @@ dpg_container_parse_u16(char *str, struct dpg_container *c)
 {
 	int rc;
 
-	rc = dpg_container_parse(str, c, sizeof(uint32_t),
-			dpg_parse_u16, dpg_increment_u16);
+	rc = dpg_container_parse(str, c, dpg_parse_u16);
 
 	return rc;
 }
@@ -1273,8 +1281,7 @@ dpg_container_parse_ipv4(char *str, struct dpg_container *c)
 {
 	int rc;
 
-	rc = dpg_container_parse(str, c, sizeof(uint32_t),
-			dpg_parse_ipv4, dpg_increment_u32);
+	rc = dpg_container_parse(str, c, dpg_parse_ipv4);
 
 	return rc;
 }
@@ -1284,8 +1291,7 @@ dpg_container_parse_ipv6(char *str, struct dpg_container *c)
 {
 	int rc;
 
-	rc = dpg_container_parse(str, c, sizeof(struct dpg_ipv6),
-			dpg_parse_ipv6,	dpg_increment_ipv6);
+	rc = dpg_container_parse(str, c, dpg_ipv6_parse);
 
 	return rc;
 }
@@ -1303,12 +1309,11 @@ dpg_task_copy(struct dpg_task *dst, struct dpg_task *src)
 
 	dpg_container_copy(&dst->src_ip, &src->src_ip);
 	dpg_container_copy(&dst->dst_ip, &src->dst_ip);
-
 	dpg_container_copy(&dst->icmp_id, &src->icmp_id);
 	dpg_container_copy(&dst->icmp_seq, &src->icmp_seq);
 
 	dst->srv6 = src->srv6;
-	dst->srv6_src = src->srv6_src;
+	memcpy(dst->srv6_src, src->srv6_src, sizeof(dst->srv6_src));
 
 	dpg_container_copy(&dst->srv6_dst, &src->srv6_dst);
 
@@ -1451,8 +1456,8 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 					dpg_invalid_argument(0, optname);
 				}
 			} else if (!strcmp(optname, "srv6-src")) {
-				rc = dpg_parse_ipv6(optarg, &task->srv6_src);
-				if (rc < 0) {
+				rc = inet_pton(AF_INET6, optarg, task->srv6_src);
+				if (rc != 1) {
 					dpg_invalid_argument(0, optname);
 				}
 				task->srv6 = 1;
@@ -1634,10 +1639,10 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 	}
 
 	if (task->srv6) {
-		if (dpg_ipv6_iszero(&task->srv6_src)) {
+		if (dpg_is_zero(&task->srv6_src, sizeof(task->srv6_src))) {
 			dpg_argument_not_specified(0, "srv6-src");
 		}
-		if (dpg_container_is_empty(&task->srv6_dst)) {
+		if (task->srv6_dst.size == 0) {
 			dpg_argument_not_specified(0, "srv6-dst");
 		}
 	}
@@ -1676,9 +1681,7 @@ dpg_create_icmp_request(struct dpg_task *task)
 {
 	bool overflow;
 	int ih_total_length, pkt_len;
-	uint16_t *icmp_id, *icmp_seq;
-	uint32_t *src_ip, *dst_ip;
-	struct dpg_ipv6 *srv6_dst;
+	dpg_uint128_t srv6_dst, src_ip, dst_ip, icmp_id, icmp_seq;
 	struct rte_mbuf *m;
 	struct dpg_eth_hdr *eh;
 	struct dpg_ipv4_hdr *ih;
@@ -1712,8 +1715,8 @@ dpg_create_icmp_request(struct dpg_task *task)
 		ih6->payload_len = rte_cpu_to_be_16(m->pkt_len - (sizeof(*eh) + sizeof(*ih6)));
 		ih6->proto = IPPROTO_ROUTING;
 		ih6->hop_limits = 64;
-		dpg_ipv6_hton(ih6->src_addr, &task->srv6_src);
-		dpg_ipv6_hton(ih6->dst_addr, srv6_dst);
+		memcpy(ih6->src_addr, task->srv6_src, sizeof(ih6->src_addr));
+		dpg_uint128_to_ipv6(ih6->dst_addr, srv6_dst);
 
 		srh->next_header = IPPROTO_IPIP;
 		srh->hdr_ext_len = sizeof(*srh) / 8 - 1;
@@ -1755,20 +1758,20 @@ dpg_create_icmp_request(struct dpg_task *task)
 	ih->hdr_checksum = 0;
 
 	src_ip = dpg_container_get(&task->src_ip);
-	ih->src_addr = rte_cpu_to_be_32(*src_ip);
+	ih->src_addr = rte_cpu_to_be_32(src_ip);
 
 	dst_ip = dpg_container_get(&task->dst_ip);
-	ih->dst_addr = rte_cpu_to_be_32(*dst_ip);
+	ih->dst_addr = rte_cpu_to_be_32(dst_ip);
 
 	ich->icmp_type = DPG_IP_ICMP_ECHO_REQUEST;
 	ich->icmp_code = 0;
 	ich->icmp_cksum = 0;
 
 	icmp_id = dpg_container_get(&task->icmp_id);
-	ich->icmp_ident = rte_cpu_to_be_16(*icmp_id);
+	ich->icmp_ident = rte_cpu_to_be_16(icmp_id);
 
 	icmp_seq = dpg_container_get(&task->icmp_seq);
-	ich->icmp_seq_nb = rte_cpu_to_be_16(*icmp_seq);
+	ich->icmp_seq_nb = rte_cpu_to_be_16(icmp_seq);
 
 	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
 	ich->icmp_cksum = dpg_cksum(ich, ih_total_length - sizeof(*ih));
@@ -1901,6 +1904,7 @@ dpg_ipv6_input(struct dpg_task *task, struct rte_mbuf *m)
 	uint8_t *ptr;
 	char tgtbuf[INET6_ADDRSTRLEN];
 	char desc[128];
+	dpg_uint128_t target;
 	struct dpg_eth_hdr *eh;
 	struct dpg_ipv6_hdr *ih6;
 	struct dpg_icmpv6_hdr *ich6;
@@ -1959,7 +1963,8 @@ dpg_ipv6_input(struct dpg_task *task, struct rte_mbuf *m)
 				dpg_log_ipv6(task, DPG_RX, eh, ih6, desc);
 			}
 
-			rc = dpg_container_find(&task->addresses6, &ns->target);
+			target = dpg_ipv6_to_uint128(ns->target);
+			rc = dpg_container_find(&task->addresses6, target);
 			if (rc < 0) {
 				return -EINVAL;
 			}
