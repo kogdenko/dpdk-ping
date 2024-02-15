@@ -307,6 +307,8 @@ struct dpg_task {
 struct dpg_port {
 	dpg_eth_addr_t mac_addr;
 
+	int id;
+
 	int rps_max;
 	int rps_cur;
 	int rps_lo;
@@ -342,7 +344,7 @@ struct dpg_lcore {
 
 static volatile int g_dpg_done;
 static uint64_t g_dpg_hz;
-static struct dpg_port g_dpg_ports[RTE_MAX_ETHPORTS];
+static struct dpg_port *g_dpg_ports[RTE_MAX_ETHPORTS];
 static struct dpg_lcore g_dpg_lcores[RTE_MAX_LCORE];
 static struct rte_mempool *g_dpg_pktmbuf_pool;
 static struct rte_eth_conf g_dpg_port_conf;
@@ -1552,6 +1554,16 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 			if (task->port_id == RTE_MAX_ETHPORTS) {
 				dpg_die("DPDK doesn't run on port '%s'\n", optarg);		
 			}
+
+			if (g_dpg_ports[task->port_id] == NULL) {
+				port = dpg_xmalloc(sizeof(*port));
+				memset(port, 0, sizeof(*port));
+				port->id = task->port_id;
+				port->rps_max = DPG_RPS_DEFAULT;
+				dpg_dlist_init(&port->task_head);
+
+				g_dpg_ports[task->port_id] = port;
+			}
 			break;
 
 		case 'q':
@@ -1672,7 +1684,7 @@ dpg_parse_task(struct dpg_task **ptask, struct dpg_task *tmpl, struct dpg_task *
 	dpg_iterator_init(&task->icmp_id_it, &task->icmp_id, 1, 0);
 	dpg_iterator_init(&task->icmp_seq_it, &task->icmp_seq, 1, 0);
 
-	port = g_dpg_ports + task->port_id;
+	port = g_dpg_ports[task->port_id];
 	DPG_DLIST_FOREACH(tmp, &port->task_head, plist) {
 		if (task->queue_id == tmp->queue_id) {
 			rte_eth_dev_get_name_by_port(task->port_id, port_name);
@@ -1698,7 +1710,7 @@ static void
 dpg_set_eth_hdr_addresses(struct dpg_task *task, struct dpg_eth_hdr *eh)
 {
 	eh->dst_addr = task->dst_eth_addr;
-	eh->src_addr = g_dpg_ports[task->port_id].mac_addr;
+	eh->src_addr = g_dpg_ports[task->port_id]->mac_addr;
 }
 
 static struct rte_mbuf *
@@ -1908,7 +1920,7 @@ dpg_create_neighbour_advertisment(struct dpg_task *task, struct rte_mbuf *m,
 	opt = (struct dpg_target_link_layer_address_option *)(na + 1);
 	opt->type = 2;
 	opt->length = sizeof(*opt) / 8;
-	opt->address = g_dpg_ports[task->port_id].mac_addr;
+	opt->address = g_dpg_ports[task->port_id]->mac_addr;
 
 	memcpy(pseudo.src_addr, ih->src_addr, sizeof(pseudo.src_addr));
 	memcpy(pseudo.dst_addr, ih->dst_addr, sizeof(pseudo.dst_addr));
@@ -2045,7 +2057,7 @@ dpg_arp_input(struct dpg_task *task, struct rte_mbuf *m)
 
 	ah->arp_opcode = RTE_BE16(DPG_ARP_OP_REPLY);
 	ah->arp_tha = task->dst_eth_addr;
-	ah->arp_sha = g_dpg_ports[task->port_id].mac_addr;
+	ah->arp_sha = g_dpg_ports[task->port_id]->mac_addr;
 	DPG_SWAP(ah->arp_tip, ah->arp_sip);
 
 	dpg_log_arp(task, DPG_TX, NULL, ah);
@@ -2181,7 +2193,7 @@ drop:
 			task->tx_bytes += task->tx_pkts[i]->pkt_len;
 		}
 
-		port = g_dpg_ports + task->port_id;
+		port = g_dpg_ports[task->port_id];
 
 		dpg_counter_add(&port->ipackets, n_rx);
 		dpg_counter_add(&port->ibytes, rx_bytes);
@@ -2240,7 +2252,7 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 	rps = DPG_MIN(rps, port->rps_max);
 
 	if (rps != port->rps_cur) {
-		rte_eth_dev_get_name_by_port(port - g_dpg_ports, port_name);
+		rte_eth_dev_get_name_by_port(port->id, port_name);
 		dpg_norm(rps_prev_buf, port->rps_cur, 1);
 		dpg_norm(rps_buf, rps, 1);
 		dpg_norm(rps_lo_buf, port->rps_lo, 1);
@@ -2291,7 +2303,7 @@ dpg_get_stats(uint64_t *ipps_accum, uint64_t *ibps_accum,
 	*obps_accum = 0;
 
 	RTE_ETH_FOREACH_DEV(port_id) {
-		port = g_dpg_ports + port_id;
+		port = g_dpg_ports[port_id];
 
 		if (!dpg_port_is_configured(port)) {
 			continue;
@@ -2400,7 +2412,7 @@ dpg_print_port_stat(int port_id)
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 	struct dpg_port *port;
 
-	port = g_dpg_ports + port_id;
+	port = g_dpg_ports[port_id];
 
 	rte_eth_dev_get_name_by_port(port_id, port_name);
 
@@ -2486,12 +2498,6 @@ main(int argc, char **argv)
 
 	g_dpg_hz = rte_get_tsc_hz();
 
-	for (i = 0; i < DPG_ARRAY_SIZE(g_dpg_ports); ++i) {
-		port = g_dpg_ports + i;
-		port->rps_max = DPG_RPS_DEFAULT;
-		dpg_dlist_init(&port->task_head);
-	}
-
 	for (i = 0; i < DPG_ARRAY_SIZE(g_dpg_lcores); ++i) {
 		lcore = g_dpg_lcores + i;
 		dpg_dlist_init(&lcore->task_head);
@@ -2527,7 +2533,7 @@ main(int argc, char **argv)
 	n_mbufs = DPG_MEMPOOL_CACHE_SIZE;
 
 	RTE_ETH_FOREACH_DEV(port_id) {
-		port = g_dpg_ports + port_id;
+		port = g_dpg_ports[port_id];
 		if (!dpg_port_is_configured(port)) {
 			continue;
 		}
@@ -2588,7 +2594,7 @@ main(int argc, char **argv)
 	}
 
 	RTE_ETH_FOREACH_DEV(port_id) {
-		port = g_dpg_ports + port_id;
+		port = g_dpg_ports[port_id];
 		if (!dpg_port_is_configured(port)) {
 			continue;
 		}
