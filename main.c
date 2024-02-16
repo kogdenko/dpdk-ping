@@ -135,6 +135,8 @@ struct dpg_darray {
 };
 
 struct dpg_container {
+	struct dpg_dlist list;
+
 	dpg_uint128_t size;
 
 	struct dpg_darray array;
@@ -143,10 +145,12 @@ struct dpg_container {
 	dpg_uint128_t end;
 
 	dpg_uint128_t (*get)(struct dpg_container *, dpg_uint128_t);
-	int (*find)(struct dpg_container *, dpg_uint128_t);
+	bool (*find)(struct dpg_container *, dpg_uint128_t);
 };
 
 struct dpg_iterator {
+	struct dpg_dlist list;
+
 	dpg_uint128_t current;
 	dpg_uint128_t pos;
 	dpg_uint128_t step;
@@ -259,6 +263,15 @@ struct dpg_srv6_hdr {
 	uint8_t localsid[DPG_IPV6_ADDR_SIZE];
 } DPG_PACKED;
 
+enum dpg_session_field {
+	DPG_SESSION_SRC_IP = 0,
+	DPG_SESSION_DST_IP,
+	DPG_SESSION_ICMP_ID,
+	DPG_SESSION_ICMP_SEQ,
+	DPG_SESSION_SRV6_DST,
+	DPG_SESSION_FIELD_MAX,
+};
+
 struct dpg_task {
 	struct dpg_dlist llist;
 	struct dpg_dlist plist;
@@ -270,11 +283,9 @@ struct dpg_task {
 	volatile int rps;
 	uint64_t req_tx_time;
 
-	struct dpg_iterator src_ip_it;
-	struct dpg_iterator dst_ip_it;
-	struct dpg_iterator icmp_id_it;
-	struct dpg_iterator icmp_seq_it;
-	struct dpg_iterator srv6_dst_it;
+	struct dpg_iterator session_field[DPG_SESSION_FIELD_MAX];
+
+	struct dpg_dlist session_field_head;
 
 	int tx_bytes;
 	int n_tx_pkts;
@@ -295,14 +306,10 @@ struct dpg_port {
 	struct dpg_container addresses4;
 	struct dpg_container addresses6;
 
-	struct dpg_container src_ip;
-	struct dpg_container dst_ip;
-	struct dpg_container icmp_id;
-	struct dpg_container icmp_seq;
+	struct dpg_container session_field[DPG_SESSION_FIELD_MAX];
 
 	int srv6;
 	uint8_t srv6_src[DPG_IPV6_ADDR_SIZE];
-	struct dpg_container srv6_dst;
 
 	int id;
 
@@ -324,6 +331,8 @@ struct dpg_port {
 	uint64_t obytes_prev;
 
 	struct dpg_dlist task_head;
+
+	struct dpg_dlist session_field_head;
 
 	uint16_t n_rxd;
 	uint16_t n_txd;
@@ -497,6 +506,28 @@ dpg_dlist_insert_head(struct dpg_dlist *head, struct dpg_dlist *l)
 	dpg_dlist_insert_head(head, &((var)->field))
 
 static void
+dpg_dlist_insert_tail(struct dpg_dlist *head, struct dpg_dlist *l)
+{
+	l->dls_next = head;
+	l->dls_prev = head->dls_prev;
+	head->dls_prev->dls_next = l;
+	head->dls_prev = l;
+}
+
+#define DPG_DLIST_INSERT_TAIL(head, var, field) \
+	dpg_dlist_insert_tail(head, &((var)->field))
+
+static void
+dpg_dlist_remove(struct dpg_dlist *list)
+{
+	list->dls_next->dls_prev = list->dls_prev;
+	list->dls_prev->dls_next = list->dls_next;
+}
+
+#define DPG_DLIST_REMOVE(var, field) \
+	dpg_dlist_remove(&(var)->field)
+
+static void
 dpg_counter_add(struct dpg_counter *c, uint64_t add)
 {
 	c->per_lcore[rte_lcore_id()] += add;
@@ -662,73 +693,140 @@ dpg_darray_find(struct dpg_darray *da, void *item)
 }
 
 static dpg_uint128_t
-dpg_iter_array_get(struct dpg_container *c, dpg_uint128_t i)
+dpg_container_array_get(struct dpg_container *ct, dpg_uint128_t i)
 {
 	dpg_uint128_t *val;
 
-	val = dpg_darray_get(&c->array, i);
+	val = dpg_darray_get(&ct->array, i);
 	return *val;
 }
 
-static int
-dpg_iter_array_find(struct dpg_container *c, dpg_uint128_t val)
+static bool
+dpg_container_array_find(struct dpg_container *ct, dpg_uint128_t val)
 {
 	int rc;
 
-	rc = dpg_darray_find(&c->array, &val);
+	rc = dpg_darray_find(&ct->array, &val);
 
-	return rc < 0 ? rc : 0;
+	return rc >= 0;
 }
 
 static void
-dpg_iter_array_init(struct dpg_container *c)
+dpg_container_array_init(struct dpg_container *ct)
 {
-	dpg_darray_init(&c->array, sizeof(dpg_uint128_t));
+	dpg_darray_init(&ct->array, sizeof(dpg_uint128_t));
 
-	c->get = dpg_iter_array_get;
-	c->find = dpg_iter_array_find;
+	ct->get = dpg_container_array_get;
+	ct->find = dpg_container_array_find;
 }
 
 static dpg_uint128_t
-dpg_iter_interval_get(struct dpg_container *c, dpg_uint128_t i)
+dpg_container_interval_get(struct dpg_container *ct, dpg_uint128_t i)
 {
-	assert(i < c->size);
-	return c->begin + i;
+	assert(i < ct->size);
+	return ct->begin + i;
+}
+
+static bool
+dpg_container_interval_find(struct dpg_container *ct, dpg_uint128_t val)
+{
+	return val >= ct->begin && val <= ct->end;
+}
+
+static void
+dpg_container_interval_init(struct dpg_container *ct)
+{
+	ct->get = dpg_container_interval_get;
+	ct->find = dpg_container_interval_find;
+}
+
+static dpg_uint128_t
+dpg_container_get(struct dpg_container *ct, dpg_uint128_t i)
+{
+	assert(ct->size);
+	return (*ct->get)(ct, i);
+}
+
+static dpg_uint128_t
+dpg_iterator_get(struct dpg_iterator *it)
+{
+	return dpg_container_get(it->container, it->current);
+}
+
+static bool
+dpg_container_find(struct dpg_container *ct, dpg_uint128_t val)
+{
+	return (*ct->find)(ct, val);
+}
+
+static void
+dpg_container_deinit(struct dpg_container *ct)
+{
+	dpg_darray_deinit(&ct->array);
+	ct->size = 0;
 }
 
 static int
-dpg_iter_interval_find(struct dpg_container *c, dpg_uint128_t val)
+dpg_container_parse(char *str, struct dpg_container *ct, int (*parse)(char *, dpg_uint128_t *))
 {
-	if (val >= c->begin && val <= c->end) {
-		return 0;
+	int rc;
+	dpg_uint128_t *val;
+	char *s, *d;
+
+	dpg_container_deinit(ct);
+
+	d = strchr(str, '-');
+	if (d == NULL) {
+		dpg_container_array_init(ct);
+
+		for (s = strtok(str, ","); s != NULL; s = strtok(NULL, ",")) {
+			val = dpg_darray_add(&ct->array);
+			rc = (*parse)(s, val);
+			if (rc < 0) {
+				goto err;
+			}
+		}
+
+		ct->size = ct->array.size;
 	} else {
-		return -ESRCH;
+		*d = '\0';
+
+		dpg_container_interval_init(ct);
+
+		rc = (*parse)(str, &ct->begin);
+		if (rc < 0) {
+			goto err;
+		}
+		rc = (*parse)(d + 1, &ct->end);
+		if (rc < 0) {
+			goto err;
+		}
+		*d = '-';
+	
+		if (ct->begin > ct->end) {
+			rc = -EINVAL;
+			goto err;
+		}
+
+		ct->size = ct->end - ct->begin + 1;
 	}
+
+	return 0;
+
+err:
+	dpg_container_deinit(ct);
+	return rc;
 }
 
 static void
-dpg_iter_interval_init(struct dpg_container *c)
-{
-	c->get = dpg_iter_interval_get;
-	c->find = dpg_iter_interval_find;
-}
-
-static dpg_uint128_t
-dpg_container_get(struct dpg_container *c, dpg_uint128_t i)
-{
-	assert(c->size);
-	return (*c->get)(c, i);
-}
-
-static void
-dpg_iterator_init(struct dpg_iterator *it, struct dpg_container *c,
+dpg_iterator_init(struct dpg_iterator *it, struct dpg_container *ct,
 		dpg_uint128_t step, dpg_uint128_t pos)
 {
-	assert(c->size != 0);
+	assert(ct->size != 0);
 
-	it->container = c;
+	it->container = ct;
 	it->step = step;
-	it->pos = pos < c->size ? pos : pos % c->size;
+	it->pos = pos < ct->size ? pos : pos % ct->size;
 	it->current = it->pos;
 }
 
@@ -750,75 +848,6 @@ dpg_iterator_next(struct dpg_iterator *it)
 	}
 
 	return overflow;
-}
-
-static dpg_uint128_t
-dpg_iterator_get(struct dpg_iterator *it)
-{
-	return dpg_container_get(it->container, it->current);
-}
-
-static int
-dpg_container_find(struct dpg_container *c, dpg_uint128_t val)
-{
-	return (*c->find)(c, val);
-}
-
-static void
-dpg_container_deinit(struct dpg_container *c)
-{
-	dpg_darray_deinit(&c->array);
-	c->size = 0;
-}
-
-static int
-dpg_container_parse(char *str, struct dpg_container *c, int (*parse)(char *, dpg_uint128_t *))
-{
-	int rc;
-	dpg_uint128_t *val;
-	char *s, *d;
-
-	d = strchr(str, '-');
-	if (d == NULL) {
-		dpg_iter_array_init(c);
-
-		for (s = strtok(str, ","); s != NULL; s = strtok(NULL, ",")) {
-			val = dpg_darray_add(&c->array);
-			rc = (*parse)(s, val);
-			if (rc < 0) {
-				goto err;
-			}
-		}
-
-		c->size = c->array.size;
-	} else {
-		*d = '\0';
-
-		dpg_iter_interval_init(c);
-
-		rc = (*parse)(str, &c->begin);
-		if (rc < 0) {
-			goto err;
-		}
-		rc = (*parse)(d + 1, &c->end);
-		if (rc < 0) {
-			goto err;
-		}
-		*d = '-';
-	
-		if (c->begin > c->end) {
-			rc = -EINVAL;
-			goto err;
-		}
-
-		c->size = c->end - c->begin + 1;
-	}
-
-	return 0;
-
-err:
-	dpg_container_deinit(c);
-	return rc;
 }
 
 static const char *
@@ -1307,6 +1336,19 @@ dpg_container_parse_ipv6(char *str, struct dpg_container *c)
 	return rc;
 }
 
+static void
+dpg_add_session_field(struct dpg_port *port, int field_id)
+{
+	struct dpg_container *field;
+
+	field = port->session_field + field_id;
+	if (field->list.dls_next != NULL) {
+		DPG_DLIST_REMOVE(field, list);
+		field->list.dls_next = NULL;
+	}
+	DPG_DLIST_INSERT_TAIL(&port->session_field_head, field, list);
+}
+
 static struct dpg_port *
 dpg_create_port(void)
 {
@@ -1317,15 +1359,24 @@ dpg_create_port(void)
 	memset(port, 0, sizeof(*port));
 	port->id = RTE_MAX_ETHPORTS;
 	port->rps_max = DPG_RPS_DEFAULT;
+	port->pkt_len = DPG_PKT_LEN_MIN;
+
 	dpg_dlist_init(&port->task_head);
+	dpg_dlist_init(&port->session_field_head);
+
 	for (i = 0; i < DPG_ARRAY_SIZE(port->dst_eth_addr.addr_bytes); ++i) {
 		port->dst_eth_addr.addr_bytes[i] = 0xFF;
 	}
-	dpg_container_parse_ipv4(DPG_SRC_IP_DEFAULT, &port->src_ip);
-	dpg_container_parse_ipv4(DPG_DST_IP_DEFAULT, &port->dst_ip);
-	dpg_container_parse_u16(DPG_ICMP_ID_DEFAULT, &port->icmp_id);
-	dpg_container_parse_u16(DPG_ICMP_SEQ_DEFAULT, &port->icmp_seq);
-	port->pkt_len = DPG_PKT_LEN_MIN;
+
+	dpg_container_parse_ipv4(DPG_SRC_IP_DEFAULT, &port->session_field[DPG_SESSION_SRC_IP]);
+	dpg_container_parse_ipv4(DPG_DST_IP_DEFAULT, &port->session_field[DPG_SESSION_DST_IP]);
+	dpg_container_parse_u16(DPG_ICMP_ID_DEFAULT, &port->session_field[DPG_SESSION_ICMP_ID]);
+	dpg_container_parse_u16(DPG_ICMP_SEQ_DEFAULT, &port->session_field[DPG_SESSION_ICMP_SEQ]);
+
+	dpg_add_session_field(port, DPG_SESSION_ICMP_ID);
+	dpg_add_session_field(port, DPG_SESSION_SRC_IP);
+	dpg_add_session_field(port, DPG_SESSION_DST_IP);
+	dpg_add_session_field(port, DPG_SESSION_ICMP_SEQ);
 
 	return port;
 }
@@ -1333,9 +1384,12 @@ dpg_create_port(void)
 static void
 dpg_create_task(uint16_t port_id, uint16_t lcore_id, uint16_t queue_id)
 {
+	int field_id;
 	struct dpg_port *port;
 	struct dpg_lcore *lcore;
 	struct dpg_task *task;
+	struct dpg_container *ct;
+	struct dpg_iterator *it;
 
 	port = dpg_port_get(port_id);
 	lcore = g_dpg_lcores + lcore_id;
@@ -1347,13 +1401,14 @@ dpg_create_task(uint16_t port_id, uint16_t lcore_id, uint16_t queue_id)
 	task->lcore_id = lcore_id;
 	task->queue_id = queue_id;
 
-	if (port->srv6) {
-		dpg_iterator_init(&task->srv6_dst_it, &port->srv6_dst, port->n_queues, queue_id);
+	dpg_dlist_init(&task->session_field_head);
+
+	DPG_DLIST_FOREACH(ct, &port->session_field_head, list) {
+		field_id = ct - port->session_field;
+		it = task->session_field + field_id;
+		dpg_iterator_init(it, ct, port->n_queues, queue_id);
+		DPG_DLIST_INSERT_TAIL(&task->session_field_head, it, list);
 	}
-	dpg_iterator_init(&task->src_ip_it, &port->src_ip, port->n_queues, queue_id);
-	dpg_iterator_init(&task->dst_ip_it, &port->dst_ip, port->n_queues, queue_id);
-	dpg_iterator_init(&task->icmp_id_it, &port->icmp_id, port->n_queues, queue_id);
-	dpg_iterator_init(&task->icmp_seq_it, &port->icmp_seq, port->n_queues, queue_id);
 
 	DPG_DLIST_INSERT_HEAD(&lcore->task_head, task, llist);
 	DPG_DLIST_INSERT_HEAD(&port->task_head, task, plist);
@@ -1439,6 +1494,7 @@ dpg_parse_port(int argc, char **argv)
 	const char *optname;
 	struct dpg_port *port;
 	struct dpg_container lcores;
+	struct dpg_container *ct;
 
 	static struct option long_options[] = {
 		{ "help", no_argument, 0, 'h' },
@@ -1453,6 +1509,8 @@ dpg_parse_port(int argc, char **argv)
 		{ NULL, 0, 0, 0 },
 	};
 
+	memset(&lcores, 0, sizeof(lcores));
+
 	port = dpg_create_port();
 
 	while ((opt = getopt_long(argc, argv, "hV:b:l:p:R:E:4:6:B:H:s:d:L:",
@@ -1465,15 +1523,19 @@ dpg_parse_port(int argc, char **argv)
 			} else if (!strcmp(optname, "tx-verbose")) {
 				port->verbose[DPG_TX] = strtoul(optarg, NULL, 10);
 			} else if (!strcmp(optname, "icmp-id")) {
-				rc = dpg_container_parse_u16(optarg, &port->icmp_id);
+				ct = port->session_field + DPG_SESSION_ICMP_ID;
+				rc = dpg_container_parse_u16(optarg, ct);
 				if (rc < 0) {
 					dpg_invalid_argument(0, optname);
 				}
+				dpg_add_session_field(port, DPG_SESSION_ICMP_ID);
 			} else if (!strcmp(optname, "icmp-seq")) {
-				rc = dpg_container_parse_u16(optarg, &port->icmp_seq);
+				ct = port->session_field + DPG_SESSION_ICMP_SEQ;
+				rc = dpg_container_parse_u16(optarg, ct);
 				if (rc < 0) {
 					dpg_invalid_argument(0, optname);
 				}
+				dpg_add_session_field(port, DPG_SESSION_ICMP_SEQ);
 			} else if (!strcmp(optname, "srv6-src")) {
 				rc = inet_pton(AF_INET6, optarg, port->srv6_src);
 				if (rc != 1) {
@@ -1481,11 +1543,13 @@ dpg_parse_port(int argc, char **argv)
 				}
 				port->srv6 = 1;
 			} else if (!strcmp(optname, "srv6-dst")) {
-				rc = dpg_container_parse_ipv6(optarg, &port->srv6_dst);
+				ct = port->session_field + DPG_SESSION_SRV6_DST;
+				rc = dpg_container_parse_ipv6(optarg, ct);
 				if (rc < 0) {
 					dpg_invalid_argument(0, optname);
 				}
 				port->srv6 = 1;
+				dpg_add_session_field(port, DPG_SESSION_SRV6_DST);
 			} else if (!strcmp(optname, "software-counters")) {
 				rc = dpg_parse_bool(optarg, &g_dpg_software_counters);
 				if (rc < 0) {
@@ -1605,17 +1669,21 @@ dpg_parse_port(int argc, char **argv)
 			break;
 
 		case 's':
-			rc = dpg_container_parse_ipv4(optarg, &port->src_ip);
+			ct = port->session_field + DPG_SESSION_SRC_IP;
+			rc = dpg_container_parse_ipv4(optarg, ct);
 			if (rc < 0) {
 				dpg_invalid_argument(opt, NULL);
 			}
+			dpg_add_session_field(port, DPG_SESSION_SRC_IP);
 			break;
 
 		case 'd':
-			rc = dpg_container_parse_ipv4(optarg, &port->dst_ip);
+			ct = port->session_field + DPG_SESSION_DST_IP;
+			rc = dpg_container_parse_ipv4(optarg, ct);
 			if (rc < 0) {
 				dpg_invalid_argument(opt, NULL);
 			}
+			dpg_add_session_field(port, DPG_SESSION_DST_IP);
 			break;
 
 		case 'L':
@@ -1648,7 +1716,7 @@ dpg_parse_port(int argc, char **argv)
 		if (dpg_is_zero(&port->srv6_src, sizeof(port->srv6_src))) {
 			dpg_argument_not_specified(0, "srv6-src");
 		}
-		if (port->srv6_dst.size == 0) {
+		if (port->session_field[DPG_SESSION_SRV6_DST].size == 0) {
 			dpg_argument_not_specified(0, "srv6-dst");
 		}
 	}
@@ -1668,10 +1736,23 @@ dpg_set_eth_hdr_addresses(struct dpg_port *port, struct dpg_eth_hdr *eh)
 	eh->src_addr = port->src_eth_addr;
 }
 
+static void
+dpg_next_session(struct dpg_task *task)
+{
+	bool overflow;
+	struct dpg_iterator *it;
+
+	DPG_DLIST_FOREACH(it, &task->session_field_head, list) {
+		overflow = dpg_iterator_next(it);
+		if (!overflow) {
+			break;
+		}
+	}
+}
+
 static struct rte_mbuf *
 dpg_create_icmp_request(struct dpg_task *task)
 {
-	bool overflow;
 	int ih_total_length, pkt_len;
 	dpg_uint128_t srv6_dst, src_ip, dst_ip, icmp_id, icmp_seq;
 	struct rte_mbuf *m;
@@ -1681,6 +1762,7 @@ dpg_create_icmp_request(struct dpg_task *task)
 	struct dpg_icmp_hdr *ich;
 	struct dpg_srv6_hdr *srh;
 	struct dpg_port *port;
+	struct dpg_iterator *field;
 
 	port = dpg_port_get(task->port_id);
 
@@ -1704,7 +1786,8 @@ dpg_create_icmp_request(struct dpg_task *task)
 		srh = (struct dpg_srv6_hdr *)(ih6 + 1);
 		ih = (struct dpg_ipv4_hdr *)(srh + 1);
 
-		srv6_dst = dpg_iterator_get(&task->srv6_dst_it);
+		field = task->session_field + DPG_SESSION_SRV6_DST;
+		srv6_dst = dpg_iterator_get(field);
 
 		ih6->vtc_flow = rte_cpu_to_be_32(0x60000000);
 		ih6->payload_len = rte_cpu_to_be_16(m->pkt_len - (sizeof(*eh) + sizeof(*ih6)));
@@ -1721,8 +1804,6 @@ dpg_create_icmp_request(struct dpg_task *task)
 		srh->flags = 0;
 		srh->tag = 0;
 		memcpy(srh->localsid, ih6->dst_addr, DPG_IPV6_ADDR_SIZE);
-
-		overflow = dpg_iterator_next(&task->srv6_dst_it);
 	} else {
 		m->pkt_len = DPG_MAX(port->pkt_len, pkt_len);
 		ih_total_length = m->pkt_len - sizeof(*eh);
@@ -1731,8 +1812,6 @@ dpg_create_icmp_request(struct dpg_task *task)
 		ih = (struct dpg_ipv4_hdr *)(eh + 1);
 
 		ih6 = NULL;
-
-		overflow = true;
 	}
 
 	m->next = NULL;
@@ -1752,37 +1831,30 @@ dpg_create_icmp_request(struct dpg_task *task)
 	ih->next_proto_id = IPPROTO_ICMP;
 	ih->hdr_checksum = 0;
 
-	src_ip = dpg_iterator_get(&task->src_ip_it);
+	field = task->session_field + DPG_SESSION_SRC_IP;
+	src_ip = dpg_iterator_get(field);
 	ih->src_addr = rte_cpu_to_be_32(src_ip);
 
-	dst_ip = dpg_iterator_get(&task->dst_ip_it);
+	field = task->session_field + DPG_SESSION_DST_IP;
+	dst_ip = dpg_iterator_get(field);
 	ih->dst_addr = rte_cpu_to_be_32(dst_ip);
 
 	ich->icmp_type = DPG_IP_ICMP_ECHO_REQUEST;
 	ich->icmp_code = 0;
 	ich->icmp_cksum = 0;
 
-	icmp_id = dpg_iterator_get(&task->icmp_id_it);
+	field = task->session_field + DPG_SESSION_ICMP_ID;
+	icmp_id = dpg_iterator_get(field);
 	ich->icmp_ident = rte_cpu_to_be_16(icmp_id);
 
-	icmp_seq = dpg_iterator_get(&task->icmp_seq_it);
+	field = task->session_field + DPG_SESSION_ICMP_SEQ;
+	icmp_seq = dpg_iterator_get(field);
 	ich->icmp_seq_nb = rte_cpu_to_be_16(icmp_seq);
 
 	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
 	ich->icmp_cksum = dpg_cksum(ich, ih_total_length - sizeof(*ih));
 
-	if (overflow) {
-		overflow = dpg_iterator_next(&task->icmp_id_it);
-		if (overflow) {
-			overflow = dpg_iterator_next(&task->src_ip_it);
-			if (overflow) {
-				overflow = dpg_iterator_next(&task->dst_ip_it);
-				if (overflow) {
-					dpg_iterator_next(&task->icmp_seq_it);
-				}
-			}
-		}
-	}
+	dpg_next_session(task);
 
 	dpg_log_icmp(port, DPG_TX, NULL, ih6, ih, ich);
 
@@ -1960,7 +2032,7 @@ dpg_ipv6_input(struct dpg_port *port, struct rte_mbuf *m)
 
 			target = dpg_ipv6_to_uint128(ns->target);
 			rc = dpg_container_find(&port->addresses6, target);
-			if (rc < 0) {
+			if (!rc) {
 				return -EINVAL;
 			}
 
