@@ -27,17 +27,20 @@
 
 #define DPG_IPV6_ADDR_SIZE 16
 
-#define DPG_RPS_DEFAULT 200*1000*1000
-#define DPG_SRC_IP_DEFAULT "1.1.1.1"
-#define DPG_DST_IP_DEFAULT "2.2.2.2"
-#define DPG_ICMP_ID_DEFAULT "1"
-#define DPG_ICMP_SEQ_DEFAULT "1"
+#define DPG_DEFAULT_RPS 200*1000*1000
+#define DPG_DEFAULT_SRC_IP "1.1.1.1"
+#define DPG_DEFAULT_DST_IP "2.2.2.2"
+#define DPG_DEFAULT_ICMP_ID "1"
+#define DPG_DEFAULT_ICMP_SEQ "1"
+#define DPG_DEFAULT_PKT_LEN 60
+#define DPG_DEFAULT_NO_DROP false
+#define DPG_DEFAULT_NO_DROP_PERCENT 0.2
+#define DPG_DEFAULT_NO_DROP_TRIES 30
+#define DPG_DEFAULT_NO_DROP_SEQ 10
 
 #define DPG_LOG_BUFSIZE 512
 
-#define DPG_SLOWSTART_RPS_MIN 5
-
-#define DPG_PKT_LEN_MIN 60
+#define DPG_NO_DROP_RPS_MIN 5
 
 #define DPG_ETH_ADDRSTRLEN 18
 
@@ -320,6 +323,7 @@ struct dpg_port {
 	uint8_t rps_seq;
 	uint8_t rps_tries;
 
+	bool software_counters;
 	struct dpg_counter ipackets;
 	struct dpg_counter opackets;
 	struct dpg_counter ibytes;
@@ -333,6 +337,11 @@ struct dpg_port {
 	struct dpg_dlist task_head;
 
 	struct dpg_dlist session_field_head;
+
+	bool no_drop;
+	double no_drop_percent;
+	u_int no_drop_tries;
+	u_int no_drop_seq;
 
 	uint16_t n_rxd;
 	uint16_t n_txd;
@@ -352,13 +361,7 @@ static uint64_t g_dpg_hz;
 static struct dpg_port *g_dpg_ports[RTE_MAX_ETHPORTS];
 static struct dpg_lcore g_dpg_lcores[RTE_MAX_LCORE];
 static struct rte_mempool *g_dpg_pktmbuf_pool;
-static struct rte_eth_conf g_dpg_port_conf;
 static bool g_dpg_bflag;
-static bool g_dpg_software_counters = false;
-static bool g_dpg_no_drop = false;
-static double g_dpg_no_drop_percent = 2.0;
-static u_int g_dpg_no_drop_tries = 30;
-static u_int g_dpg_no_drop_seq = 10;
 
 #define DPG_SWAP(a, b) do { \
 	typeof(a) t; \
@@ -1192,7 +1195,6 @@ dpg_log_icmp(struct dpg_port *port, int dir, struct dpg_eth_hdr *eh, struct dpg_
 	inet_ntop(AF_INET, &ih->src_addr, sabuf, sizeof(sabuf));
 	inet_ntop(AF_INET, &ih->dst_addr, dabuf, sizeof(dabuf));
 
-
 	dpg_strbuf_addf(&sb, "ICMP echo %s: %s->%s, id=%d, seq=%d",
 			dpg_icmp_type_string(ich->icmp_type),
 			sabuf, dabuf,
@@ -1358,8 +1360,13 @@ dpg_create_port(void)
 	port = dpg_xmalloc(sizeof(*port));
 	memset(port, 0, sizeof(*port));
 	port->id = RTE_MAX_ETHPORTS;
-	port->rps_max = DPG_RPS_DEFAULT;
-	port->pkt_len = DPG_PKT_LEN_MIN;
+	port->rps_max = DPG_DEFAULT_RPS;
+	port->pkt_len = DPG_DEFAULT_PKT_LEN;
+
+	port->no_drop = DPG_DEFAULT_NO_DROP;
+	port->no_drop_percent = DPG_DEFAULT_NO_DROP_PERCENT;
+	port->no_drop_tries = DPG_DEFAULT_NO_DROP_TRIES;
+	port->no_drop_seq = DPG_DEFAULT_NO_DROP_SEQ;
 
 	dpg_dlist_init(&port->task_head);
 	dpg_dlist_init(&port->session_field_head);
@@ -1368,10 +1375,10 @@ dpg_create_port(void)
 		port->dst_eth_addr.addr_bytes[i] = 0xFF;
 	}
 
-	dpg_container_parse_ipv4(DPG_SRC_IP_DEFAULT, &port->session_field[DPG_SESSION_SRC_IP]);
-	dpg_container_parse_ipv4(DPG_DST_IP_DEFAULT, &port->session_field[DPG_SESSION_DST_IP]);
-	dpg_container_parse_u16(DPG_ICMP_ID_DEFAULT, &port->session_field[DPG_SESSION_ICMP_ID]);
-	dpg_container_parse_u16(DPG_ICMP_SEQ_DEFAULT, &port->session_field[DPG_SESSION_ICMP_SEQ]);
+	dpg_container_parse_ipv4(DPG_DEFAULT_SRC_IP, &port->session_field[DPG_SESSION_SRC_IP]);
+	dpg_container_parse_ipv4(DPG_DEFAULT_DST_IP, &port->session_field[DPG_SESSION_DST_IP]);
+	dpg_container_parse_u16(DPG_DEFAULT_ICMP_ID, &port->session_field[DPG_SESSION_ICMP_ID]);
+	dpg_container_parse_u16(DPG_DEFAULT_ICMP_SEQ, &port->session_field[DPG_SESSION_ICMP_SEQ]);
 
 	dpg_add_session_field(port, DPG_SESSION_ICMP_ID);
 	dpg_add_session_field(port, DPG_SESSION_SRC_IP);
@@ -1423,7 +1430,7 @@ dpg_print_usage(void)
 	char eth_addr_buf[DPG_ETH_ADDRSTRLEN];
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 
-	dpg_norm(rate_buf, DPG_RPS_DEFAULT, 1);
+	dpg_norm(rate_buf, DPG_DEFAULT_RPS, 1);
 
 	printf("Usage: dpdk-ping [DPDK options] -- port options [-- port options ...]\n"
 	"\n"
@@ -1456,17 +1463,17 @@ dpg_print_usage(void)
 		dpg_bool_str(false),
 		dpg_bool_str(false),
 		rate_buf,
-		DPG_SRC_IP_DEFAULT,
-		DPG_DST_IP_DEFAULT,
-		DPG_PKT_LEN_MIN,
+		DPG_DEFAULT_SRC_IP,
+		DPG_DEFAULT_DST_IP,
+		DPG_DEFAULT_PKT_LEN,
 		0,
 		0,
-		DPG_ICMP_ID_DEFAULT,
-		DPG_ICMP_SEQ_DEFAULT,
-		dpg_bool_str(g_dpg_software_counters),
-		g_dpg_no_drop_percent,
-		g_dpg_no_drop_tries,
-		g_dpg_no_drop_seq
+		DPG_DEFAULT_ICMP_ID,
+		DPG_DEFAULT_ICMP_SEQ,
+		dpg_bool_str(DPG_DEFAULT_NO_DROP),
+		DPG_DEFAULT_NO_DROP_PERCENT,
+		DPG_DEFAULT_NO_DROP_TRIES,
+		DPG_DEFAULT_NO_DROP_SEQ
 	);
 
 	RTE_ETH_FOREACH_DEV(port_id) {
@@ -1551,31 +1558,31 @@ dpg_parse_port(int argc, char **argv)
 				port->srv6 = 1;
 				dpg_add_session_field(port, DPG_SESSION_SRV6_DST);
 			} else if (!strcmp(optname, "software-counters")) {
-				rc = dpg_parse_bool(optarg, &g_dpg_software_counters);
+				rc = dpg_parse_bool(optarg, &port->software_counters);
 				if (rc < 0) {
 					dpg_invalid_argument(0, optname);
 				}
 			} else if (!strcmp(optname, "no-drop")) {
 				rc = sscanf(optarg, "%lf,%u,%u",
-						&g_dpg_no_drop_percent,
-						&g_dpg_no_drop_tries,
-						&g_dpg_no_drop_seq);
+						&port->no_drop_percent,
+						&port->no_drop_tries,
+						&port->no_drop_seq);
 				if (rc == 0 || rc == EOF) {
 					dpg_invalid_argument(0, optname);
 				} else if (rc == 2) {
-					g_dpg_no_drop_seq = DPG_MAX(1, g_dpg_no_drop_tries / 3);
+					port->no_drop_seq = DPG_MAX(1, port->no_drop_tries / 3);
 				}
 
-				if (g_dpg_no_drop_percent <= 0 || g_dpg_no_drop_percent >= 100) {
+				if (port->no_drop_percent <= 0 || port->no_drop_percent >= 100) {
 					dpg_invalid_argument(0, optname);
 				}
 
-				if (g_dpg_no_drop_tries < 2 ||
-				    g_dpg_no_drop_tries < g_dpg_no_drop_seq) {
+				if (port->no_drop_tries < 2 ||
+				    port->no_drop_tries < port->no_drop_seq) {
 					dpg_invalid_argument(0, optname);
 				}
 
-				g_dpg_no_drop = true;
+				port->no_drop = true;
 			}
 			break;
 
@@ -1688,7 +1695,7 @@ dpg_parse_port(int argc, char **argv)
 
 		case 'L':
 			port->pkt_len = strtoul(optarg, &endptr, 10);
-			if (*endptr != '\0' || port->pkt_len < DPG_PKT_LEN_MIN) {
+			if (*endptr != '\0' || port->pkt_len < DPG_DEFAULT_PKT_LEN) {
 				dpg_invalid_argument(opt, NULL);
 			}
 			break;
@@ -1924,7 +1931,7 @@ dpg_create_neighbour_advertisment(struct dpg_port *port, struct rte_mbuf *m,
 {
 	int len;
 	uint64_t sum;
-	uint16_t target[DPG_IPV6_ADDR_SIZE];
+	uint8_t target[DPG_IPV6_ADDR_SIZE];
 	struct dpg_icmpv6_neigh_advertisment *na;
 	struct dpg_target_link_layer_address_option *opt;
 	struct dpg_ipv6_pseudohdr pseudo;
@@ -2217,7 +2224,7 @@ drop:
 		txed = 0;
 	}
 
-	if (g_dpg_software_counters) {
+	if (port->software_counters) {
 		tx_bytes = task->tx_bytes;
 		task->tx_bytes = 0;
 
@@ -2242,17 +2249,17 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 	char rps_buf[32], rps_prev_buf[32], rps_lo_buf[32], rps_step_buf[32];
 
-	if (port->rps_max <= DPG_SLOWSTART_RPS_MIN || !g_dpg_no_drop) {
+	if (port->rps_max <= DPG_NO_DROP_RPS_MIN || !port->no_drop) {
 		return port->rps_max;
 	}
 
-	if (port->rps_cur < DPG_SLOWSTART_RPS_MIN) {
-		return DPG_SLOWSTART_RPS_MIN;
+	if (port->rps_cur < DPG_NO_DROP_RPS_MIN) {
+		return DPG_NO_DROP_RPS_MIN;
 	}
 
 	port->rps_tries++;
 
-	if (ipps + 1 >= opps ||  (opps - ipps) < g_dpg_no_drop_percent * opps / 100) {
+	if (ipps + 1 >= opps ||  (opps - ipps) < port->no_drop_percent * opps / 100) {
 		port->rps_seq++;
 	} else {
 		port->rps_seq = 0;
@@ -2260,7 +2267,7 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 
 	rps = port->rps_cur;
 	
-	if (port->rps_seq == g_dpg_no_drop_seq) {
+	if (port->rps_seq == port->no_drop_seq) {
 		port->rps_seq = port->rps_tries = 0;
 
 		port->rps_lo = port->rps_cur;
@@ -2270,7 +2277,7 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 			port->rps_step *= 2;
 			rps = port->rps_lo + port->rps_step;
 		}
-	} else if (port->rps_tries == g_dpg_no_drop_tries) {
+	} else if (port->rps_tries == port->no_drop_tries) {
 		port->rps_seq = port->rps_tries = 0;
 
 		if (port->rps_step == 0) {
@@ -2341,7 +2348,7 @@ dpg_get_stats(uint64_t *ipps_accum, uint64_t *ibps_accum,
 			continue;
 		}
 
-		if (g_dpg_software_counters) {
+		if (port->software_counters) {
 			ip = dpg_counter_get(&port->ipackets);
 			ib = dpg_counter_get(&port->ibytes);
 			op = dpg_counter_get(&port->opackets);
@@ -2507,6 +2514,7 @@ main(int argc, char **argv)
 {
 	int i, rc, port_id, n_rxq, n_txq, n_mbufs, main_lcore, first_lcore;
 	char port_name[RTE_ETH_NAME_MAX_LEN];
+	struct rte_eth_conf port_conf;
 	struct rte_eth_dev_info dev_info;
 	struct rte_eth_rxconf rxq_conf;
 	struct rte_eth_txconf txq_conf;
@@ -2532,7 +2540,8 @@ main(int argc, char **argv)
 		dpg_dlist_init(&lcore->task_head);
 	}
 
-	g_dpg_port_conf.txmode.mq_mode = DPG_ETH_MQ_TX_NONE;
+	memset(&port_conf, 0, sizeof(port_conf));
+	port_conf.txmode.mq_mode = DPG_ETH_MQ_TX_NONE;
 
 	while (argc > 1) {
 		rc = dpg_parse_port(argc, argv);
@@ -2558,7 +2567,7 @@ main(int argc, char **argv)
 					port_name, -rc, rte_strerror(-rc));
 		}
 
-		port->conf = g_dpg_port_conf;
+		port->conf = port_conf;
 		if (dev_info.tx_offload_capa & DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
 			port->conf.txmode.offloads |= DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 		}
