@@ -1213,19 +1213,22 @@ dpg_log_rxtx(struct dpg_strbuf *sb,  struct dpg_task *task, struct dpg_eth_hdr *
 
 	port = dpg_port_get(task->port_id);
 
+	dpg_strbuf_adds(sb, dir == DPG_RX ? "RX ": "TX ");
+
 	rte_eth_dev_get_name_by_port(port->id, port_name);
 	dpg_strbuf_adds(sb, port_name);
+	dpg_strbuf_adds(sb, " ");
 	if (dir != DPG_RX || port->verbose[DPG_RX] < 1) {
 		return;
 	}
 	if (port->n_queues > 1) {
-		dpg_strbuf_addf(sb, "(q=%d)", task->queue_id);
+		dpg_strbuf_addf(sb, "(q=%d) ", task->queue_id);
 	}
 
 //	if (eh != NULL) {
 	dpg_eth_format_addr(shbuf, sizeof(shbuf), &eh->src_addr);
 	dpg_eth_format_addr(dhbuf, sizeof(dhbuf), &eh->dst_addr);
-	dpg_strbuf_addf(sb, " %s->%s", shbuf, dhbuf);
+	dpg_strbuf_addf(sb, "%s->%s ", shbuf, dhbuf);
 }
 
 static void
@@ -1249,7 +1252,6 @@ dpg_log_packet(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dp
 
 	dpg_log_rxtx(&sb, task, eh, dir);
 
-	dpg_strbuf_addf(&sb, ": %s ", dir == DPG_TX ? "Sent" : "Recv");
 	if (ih6 != NULL) {
 		inet_ntop(AF_INET6, &ih6->src_addr, sabuf, sizeof(sabuf));
 		inet_ntop(AF_INET6, &ih6->dst_addr, dabuf, sizeof(dabuf));
@@ -1307,8 +1309,7 @@ dpg_log_arp(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_a
 	dpg_eth_format_addr(thbuf, sizeof(thbuf), &ah->arp_tha);
 	dpg_eth_format_addr(shbuf, sizeof(shbuf), &ah->arp_sha);
 
-	dpg_strbuf_addf(&sb, ": %s ARP %s %s(%s)->%s(%s)",
-			dir == DPG_TX ? "Sent" : "Recv",
+	dpg_strbuf_addf(&sb, ": ARP %s %s(%s)->%s(%s)",
 			is_req ? "request" : "reply",
 			sibuf, shbuf, tibuf, thbuf);
 
@@ -1337,8 +1338,7 @@ dpg_log_ipv6(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_
 	inet_ntop(AF_INET6, ih->src_addr, srcbuf, sizeof(srcbuf));
 	inet_ntop(AF_INET6, ih->dst_addr, dstbuf, sizeof(dstbuf));
 
-	dpg_strbuf_addf(&sb, ": %s %s->%s: %s", dir == DPG_RX ? "Recv" : "Sent",
-			srcbuf, dstbuf, desc);
+	dpg_strbuf_addf(&sb, ": %s->%s: %s", srcbuf, dstbuf, desc);
 
 	printf("%s\n", dpg_strbuf_cstr(&sb));
 }
@@ -1359,7 +1359,7 @@ dpg_log_custom(struct dpg_task *task, struct dpg_eth_hdr *eh, const char *proto)
 
 	dpg_log_rxtx(&sb, task, eh, DPG_RX);
 
-	dpg_strbuf_addf(&sb, ": Recv %s packet", proto);
+	dpg_strbuf_addf(&sb, ": %s packet", proto);
 
 	printf("%s\n", dpg_strbuf_cstr(&sb));
 }
@@ -2778,6 +2778,7 @@ main(int argc, char **argv)
 			port->conf.rxmode.mq_mode = DPG_ETH_MQ_RX_RSS;
 			port->conf.rx_adv_conf.rss_conf.rss_hf =
 					DPG_ETH_RSS_IP | DPG_ETH_RSS_TCP | DPG_ETH_RSS_UDP;
+
 			port->conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
 		}
 
