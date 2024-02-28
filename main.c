@@ -2110,7 +2110,6 @@ dpg_create_request(struct dpg_task *task)
 	ih->time_to_live = 64;
 	ih->next_proto_id = port->proto;
 	ih->hdr_checksum = 0;
-	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
 
 	field = task->session_field + DPG_SESSION_SRC_IP;
 	src_ip = dpg_iterator_get(field);
@@ -2119,6 +2118,8 @@ dpg_create_request(struct dpg_task *task)
 	field = task->session_field + DPG_SESSION_DST_IP;
 	dst_ip = dpg_iterator_get(field);
 	ih->dst_addr = rte_cpu_to_be_32(dst_ip);
+
+	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
 
 	switch (port->proto) {
 	case IPPROTO_ICMP:
