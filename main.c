@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <rte_bus.h>
 #include <rte_common.h>
@@ -164,6 +166,9 @@ struct dpg_iterator {
 	dpg_uint128_t step;
 
 	struct dpg_container *container;
+
+//	uint32_t upper_size;
+//	uint32_t upper_mask;
 };
 
 struct dpg_eth_hdr {
@@ -308,6 +313,11 @@ struct dpg_task {
 	volatile int rps;
 	uint64_t req_tx_time;
 
+	uint32_t rand_state;
+	uint32_t rand_seed;
+	uint32_t rand_session_count;
+	uint32_t rand_session_index;
+
 	struct dpg_iterator session_field[DPG_SESSION_FIELD_MAX];
 
 	struct dpg_dlist session_field_head;
@@ -345,6 +355,10 @@ struct dpg_port {
 	int rps_step;
 	uint8_t rps_seq;
 	uint8_t rps_tries;
+
+	bool rand;
+	uint32_t rand_seed;
+	uint32_t rand_session_count;
 
 	bool software_counters;
 	struct dpg_counter ipackets;
@@ -494,6 +508,36 @@ dpg_is_zero(const void *ptr, size_t n)
 	}
 
 	return true;
+}
+
+/*static uint32_t
+dpg_upper_pow2_32(uint32_t x)
+{
+	x--;
+	x |= x >>  1lu;
+	x |= x >>  2lu;
+	x |= x >>  4lu;
+	x |= x >>  8lu;
+	x |= x >> 16lu;
+	x++;
+
+	return x;
+}*/
+
+static uint32_t
+dpg_rand_xorshift(uint32_t *state)
+{
+	uint32_t x;
+
+	x = *state;
+
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+
+	*state = x;
+
+	return x;
 }
 
 static void
@@ -773,12 +817,6 @@ dpg_container_get(struct dpg_container *ct, dpg_uint128_t i)
 	return (*ct->get)(ct, i);
 }
 
-static dpg_uint128_t
-dpg_iterator_get(struct dpg_iterator *it)
-{
-	return dpg_container_get(it->container, it->current);
-}
-
 static bool
 dpg_container_find(struct dpg_container *ct, dpg_uint128_t val)
 {
@@ -844,6 +882,12 @@ err:
 	return rc;
 }
 
+static dpg_uint128_t
+dpg_iterator_get(struct dpg_iterator *it)
+{
+	return dpg_container_get(it->container, it->current);
+}
+
 static void
 dpg_iterator_init(struct dpg_iterator *it, struct dpg_container *ct,
 		dpg_uint128_t step, dpg_uint128_t pos)
@@ -854,6 +898,8 @@ dpg_iterator_init(struct dpg_iterator *it, struct dpg_container *ct,
 	it->step = step;
 	it->pos = pos < ct->size ? pos : pos % ct->size;
 	it->current = it->pos;
+//	it->upper_size = dpg_upper_pow2_32(ct->size);
+//	it->upper_mask = it->upper_size - 1;
 }
 
 static bool
@@ -874,6 +920,21 @@ dpg_iterator_next(struct dpg_iterator *it)
 	}
 
 	return overflow;
+}
+
+static void
+dpg_iterator_set_rand(struct dpg_iterator *it, uint32_t r)
+{
+	/*uint32_t offset;
+
+	offset = r & it->upper_mask;
+	if (offset >= it->container->size) {
+		offset -= it->container->size;
+	}
+	assert(offset < it->container->size);
+	it->current = offset;*/
+
+	it->current = r % it->container->size;
 }
 
 static const char *
@@ -1141,9 +1202,9 @@ dpg_ipv4_udp_cksum(struct dpg_ipv4_hdr *ih, void *l4_hdr, int len)
 }
 
 static void
-dpg_norm2(char *buf, double val, char *fmt, int normalize)
+dpg_print_human_readable5(char *buf, size_t count, double val, char *fmt, int normalize)
 {
-	char *units[] = { "", "k", "m", "g", "t" };
+	static const char *units[] = { "", "k", "m", "g", "t" };
 	int i;
 
 	if (normalize) {
@@ -1154,15 +1215,15 @@ dpg_norm2(char *buf, double val, char *fmt, int normalize)
 		i = 0;
 	}
 
-	sprintf(buf, fmt, val, units[i]);
+	snprintf(buf, count, fmt, val, units[i]);
 }
 
 static int64_t
-dpg_unnorm(const char *s)
+dpg_parse_human_readable(const char *s)
 {
 	double val;
 	char *endptr, *unit;
-	const char *units = "kmgt";
+	static const char *units = "kmgt";
 
 	val = strtod(s, &endptr);
 	if (*endptr == '\0') {
@@ -1177,12 +1238,12 @@ dpg_unnorm(const char *s)
 }
 
 static void
-dpg_norm(char *buf, double val, int normalize)
+dpg_print_human_readable(char *buf, size_t count, double val, int normalize)
 {
 	if (normalize) {
-		dpg_norm2(buf, val, "%.3f%s", normalize);
+		dpg_print_human_readable5(buf, count, val, "%.3f%s", normalize);
 	} else {
-		dpg_norm2(buf, val, "%.0f%s", normalize);
+		dpg_print_human_readable5(buf, count, val, "%.0f%s", normalize);
 	}
 }
 
@@ -1474,23 +1535,57 @@ dpg_create_port(void)
 }
 
 static void
-dpg_create_task(uint16_t port_id, uint16_t lcore_id, uint16_t queue_id)
+dpg_set_rand_seed(struct dpg_port *port, uint32_t seed)
+{
+	port->rand_seed = (seed << 8) & 0xffffff00;
+}
+
+static void
+dpg_set_rand(struct dpg_port *port)
+{
+	port->rand = true;
+	if (port->rand_seed == 0) {
+		dpg_set_rand_seed(port, time(NULL) ^ getpid());
+	}
+}
+
+static void
+dpg_set_task_rand_session_count(struct dpg_task *task)
+{
+	uint32_t sum;
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->port_id);
+
+	task->rand_session_count = DPG_MAX(1, port->rand_session_count / port->n_queues);
+	if (task->queue_id != 0) {
+		return;
+	}
+
+	sum = task->rand_session_count * port->n_queues;
+	if (sum >= port->rand_session_count) {
+		return;
+	}
+
+	task->rand_session_count += port->rand_session_count - sum;
+}
+
+static void
+dpg_create_task(struct dpg_port *port, uint16_t lcore_id, uint16_t queue_id)
 {
 	int field_id;
 	bool first;
-	struct dpg_port *port;
 	struct dpg_lcore *lcore;
 	struct dpg_task *task;
 	struct dpg_container *ct;
 	struct dpg_iterator *it;
 
-	port = dpg_port_get(port_id);
 	lcore = g_dpg_lcores + lcore_id;
 
 	task = dpg_xmalloc(sizeof(*task));
 	memset(task, 0, sizeof(*task));
 
-	task->port_id = port_id;
+	task->port_id = port->id;
 	task->lcore_id = lcore_id;
 	task->queue_id = queue_id;
 
@@ -1509,6 +1604,14 @@ dpg_create_task(uint16_t port_id, uint16_t lcore_id, uint16_t queue_id)
 		DPG_DLIST_INSERT_TAIL(&task->session_field_head, it, list);
 	}
 
+	if (port->rand) {
+		task->rand_seed = port->rand_seed | task->queue_id;
+		task->rand_state = task->rand_seed;
+		if (port->rand_session_count) {
+			dpg_set_task_rand_session_count(task);
+		}
+	}
+
 	DPG_DLIST_INSERT_HEAD(&lcore->task_head, task, llist);
 	DPG_DLIST_INSERT_HEAD(&port->task_head, task, plist);
 }
@@ -1522,7 +1625,7 @@ dpg_print_usage(void)
 	char eth_addr_buf[DPG_ETH_ADDRSTRLEN];
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 
-	dpg_norm(rate_buf, DPG_DEFAULT_RPS, 1);
+	dpg_print_human_readable(rate_buf, sizeof(rate_buf), DPG_DEFAULT_RPS, 1);
 
 	printf("Usage: dpdk-ping [DPDK options] -- port options [-- port options ...]\n"
 	"\n"
@@ -1611,6 +1714,9 @@ dpg_parse_port(int argc, char **argv)
 		{ "srv6-dst", required_argument, 0, 0 },
 		{ "software-counters", required_argument, 0, 0 },
 		{ "no-drop",  required_argument, 0, 0 },
+		{ "rand", no_argument, 0, 0 },
+		{ "rand-seed", required_argument, 0, 0 },
+		{ "rand-sessions", required_argument, 0, 0 },
 		{ NULL, 0, 0, 0 },
 	};
 
@@ -1685,6 +1791,18 @@ dpg_parse_port(int argc, char **argv)
 				}
 
 				port->no_drop = true;
+			} else if (!strcmp(optname, "rand")) {
+				dpg_set_rand(port);
+			} else if (!strcmp(optname, "rand-seed")) {
+				port->rand = true;
+				dpg_set_rand_seed(port, strtoul(optarg, NULL, 10));
+			} else if (!strcmp(optname, "rand-sessions")) {
+				dpg_set_rand(port);
+				rc = dpg_parse_human_readable(optarg);
+				if (rc < 0) {
+					dpg_invalid_argument(0, optname);
+				}
+				port->rand_session_count = rc;
 			}
 			break;
 
@@ -1763,7 +1881,7 @@ dpg_parse_port(int argc, char **argv)
 			break;
 
 		case 'B':
-			rc = dpg_unnorm(optarg);
+			rc = dpg_parse_human_readable(optarg);
 			if (rc < 0) {
 				dpg_invalid_argument(opt, NULL);
 			}
@@ -1858,7 +1976,7 @@ dpg_parse_port(int argc, char **argv)
 
 	for (i = 0; i < lcores.size; ++i) {
 		lcore_id = dpg_container_get(&lcores, i);
-		dpg_create_task(port->id, lcore_id, i);
+		dpg_create_task(port, lcore_id, i);
 	}
 
 	return optind;
@@ -1875,12 +1993,30 @@ static void
 dpg_next_session(struct dpg_task *task)
 {
 	bool overflow;
+	uint32_t r;
 	struct dpg_iterator *it;
+	struct dpg_port *port;
 
-	DPG_DLIST_FOREACH(it, &task->session_field_head, list) {
-		overflow = dpg_iterator_next(it);
-		if (!overflow) {
-			break;
+	port = dpg_port_get(task->port_id);
+	if (port->rand) {
+		r = dpg_rand_xorshift(&task->rand_state);
+		DPG_DLIST_FOREACH(it, &task->session_field_head, list) {
+			dpg_iterator_set_rand(it, r);
+		}
+
+		if (task->rand_session_count) {
+			task->rand_session_index++;
+			if (task->rand_session_index == task->rand_session_count) {
+				task->rand_session_index = 0;
+				task->rand_state = task->rand_seed;
+			}
+		}
+	} else {
+		DPG_DLIST_FOREACH(it, &task->session_field_head, list) {
+			overflow = dpg_iterator_next(it);
+			if (!overflow) {
+				break;
+			}
 		}
 	}
 }
@@ -2495,10 +2631,11 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 
 	if (rps != port->rps_cur) {
 		rte_eth_dev_get_name_by_port(port->id, port_name);
-		dpg_norm(rps_prev_buf, port->rps_cur, 1);
-		dpg_norm(rps_buf, rps, 1);
-		dpg_norm(rps_lo_buf, port->rps_lo, 1);
-		dpg_norm(rps_step_buf, port->rps_step, 1);
+
+		dpg_print_human_readable(rps_prev_buf, sizeof(rps_prev_buf), port->rps_cur, 1);
+		dpg_print_human_readable(rps_buf, sizeof(rps_buf), rps, 1);
+		dpg_print_human_readable(rps_lo_buf, sizeof(rps_lo_buf), port->rps_lo, 1);
+		dpg_print_human_readable(rps_step_buf, sizeof(rps_step_buf), port->rps_step, 1);
 
 		printf("%s: RPS: %s->%s (lo=%s, step=%s)\n",
 				port_name, rps_prev_buf, rps_buf, rps_lo_buf, rps_step_buf);
@@ -2609,10 +2746,11 @@ dpg_print_report(double d_tsc)
 		}
 		printf("\n");
 	}
-	dpg_norm(ipps_b, ipps, 1);
-	dpg_norm(ibps_b, ibps, 1);
-	dpg_norm(opps_b, opps, 1);
-	dpg_norm(obps_b, obps, 1);
+
+	dpg_print_human_readable(ipps_b, sizeof(ipps_b), ipps, 1);
+	dpg_print_human_readable(ibps_b, sizeof(ibps_b), ibps, 1);
+	dpg_print_human_readable(opps_b, sizeof(opps_b), opps, 1);
+	dpg_print_human_readable(obps_b, sizeof(obps_b), obps, 1);
 
 	printf("%-12s", ipps_b);
 	if (g_dpg_bflag) {
