@@ -9,6 +9,8 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <rte_bus.h>
 #include <rte_common.h>
@@ -30,6 +32,8 @@
 #define DPG_DEFAULT_RPS 200*1000*1000
 #define DPG_DEFAULT_SRC_IP "1.1.1.1"
 #define DPG_DEFAULT_DST_IP "2.2.2.2"
+#define DPG_DEFAULT_SRC_PORT "1111"
+#define DPG_DEFAULT_DST_PORT "2222"
 #define DPG_DEFAULT_ICMP_ID "1"
 #define DPG_DEFAULT_ICMP_SEQ "1"
 #define DPG_DEFAULT_PKT_LEN 60
@@ -37,6 +41,9 @@
 #define DPG_DEFAULT_NO_DROP_PERCENT 0.2
 #define DPG_DEFAULT_NO_DROP_TRIES 30
 #define DPG_DEFAULT_NO_DROP_SEQ 10
+
+#define DPG_UDP_DATA_PING "ping"
+#define DPG_UDP_DATA_PONG "pong"
 
 #define DPG_LOG_BUFSIZE 512
 
@@ -159,6 +166,9 @@ struct dpg_iterator {
 	dpg_uint128_t step;
 
 	struct dpg_container *container;
+
+//	uint32_t upper_size;
+//	uint32_t upper_mask;
 };
 
 struct dpg_eth_hdr {
@@ -211,6 +221,21 @@ struct dpg_icmp_hdr {
 	rte_be16_t icmp_seq_nb;
 } DPG_PACKED;
 
+struct dpg_udp_hdr {
+	rte_be16_t src_port;
+	rte_be16_t dst_port;
+	rte_be16_t dgram_len;
+	rte_be16_t dgram_cksum;
+} DPG_PACKED;
+
+struct dpg_ipv4_pseudo_hdr {
+	rte_be32_t src;
+	rte_be32_t dst;
+	uint8_t pad;
+	uint8_t proto;
+	rte_be16_t len;
+} DPG_PACKED;
+
 struct dpg_ipv6_hdr {
 	rte_be32_t vtc_flow;
 	rte_be16_t payload_len;
@@ -226,7 +251,7 @@ struct dpg_icmpv6_hdr {
 	uint16_t checksum;
 } DPG_PACKED;
 
-struct dpg_ipv6_pseudohdr {
+struct dpg_ipv6_pseudo_hdr {
 	uint8_t src_addr[DPG_IPV6_ADDR_SIZE];
 	uint8_t dst_addr[DPG_IPV6_ADDR_SIZE];
 	rte_be32_t len;
@@ -269,6 +294,8 @@ struct dpg_srv6_hdr {
 enum dpg_session_field {
 	DPG_SESSION_SRC_IP = 0,
 	DPG_SESSION_DST_IP,
+	DPG_SESSION_SRC_PORT,
+	DPG_SESSION_DST_PORT,
 	DPG_SESSION_ICMP_ID,
 	DPG_SESSION_ICMP_SEQ,
 	DPG_SESSION_SRV6_DST,
@@ -285,6 +312,11 @@ struct dpg_task {
 
 	volatile int rps;
 	uint64_t req_tx_time;
+
+	uint32_t rand_state;
+	uint32_t rand_seed;
+	uint32_t rand_session_count;
+	uint32_t rand_session_index;
 
 	struct dpg_iterator session_field[DPG_SESSION_FIELD_MAX];
 
@@ -305,6 +337,7 @@ struct dpg_port {
 	uint8_t verbose[2];
 
 	uint16_t pkt_len;
+	uint8_t proto;
 
 	struct dpg_container addresses4;
 	struct dpg_container addresses6;
@@ -322,6 +355,10 @@ struct dpg_port {
 	int rps_step;
 	uint8_t rps_seq;
 	uint8_t rps_tries;
+
+	bool rand;
+	uint32_t rand_seed;
+	uint32_t rand_session_count;
 
 	bool software_counters;
 	struct dpg_counter ipackets;
@@ -471,6 +508,36 @@ dpg_is_zero(const void *ptr, size_t n)
 	}
 
 	return true;
+}
+
+/*static uint32_t
+dpg_upper_pow2_32(uint32_t x)
+{
+	x--;
+	x |= x >>  1lu;
+	x |= x >>  2lu;
+	x |= x >>  4lu;
+	x |= x >>  8lu;
+	x |= x >> 16lu;
+	x++;
+
+	return x;
+}*/
+
+static uint32_t
+dpg_rand_xorshift(uint32_t *state)
+{
+	uint32_t x;
+
+	x = *state;
+
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+
+	*state = x;
+
+	return x;
 }
 
 static void
@@ -750,12 +817,6 @@ dpg_container_get(struct dpg_container *ct, dpg_uint128_t i)
 	return (*ct->get)(ct, i);
 }
 
-static dpg_uint128_t
-dpg_iterator_get(struct dpg_iterator *it)
-{
-	return dpg_container_get(it->container, it->current);
-}
-
 static bool
 dpg_container_find(struct dpg_container *ct, dpg_uint128_t val)
 {
@@ -821,6 +882,12 @@ err:
 	return rc;
 }
 
+static dpg_uint128_t
+dpg_iterator_get(struct dpg_iterator *it)
+{
+	return dpg_container_get(it->container, it->current);
+}
+
 static void
 dpg_iterator_init(struct dpg_iterator *it, struct dpg_container *ct,
 		dpg_uint128_t step, dpg_uint128_t pos)
@@ -831,6 +898,8 @@ dpg_iterator_init(struct dpg_iterator *it, struct dpg_container *ct,
 	it->step = step;
 	it->pos = pos < ct->size ? pos : pos % ct->size;
 	it->current = it->pos;
+//	it->upper_size = dpg_upper_pow2_32(ct->size);
+//	it->upper_mask = it->upper_size - 1;
 }
 
 static bool
@@ -851,6 +920,21 @@ dpg_iterator_next(struct dpg_iterator *it)
 	}
 
 	return overflow;
+}
+
+static void
+dpg_iterator_set_rand(struct dpg_iterator *it, uint32_t r)
+{
+	/*uint32_t offset;
+
+	offset = r & it->upper_mask;
+	if (offset >= it->container->size) {
+		offset -= it->container->size;
+	}
+	assert(offset < it->container->size);
+	it->current = offset;*/
+
+	it->current = r % it->container->size;
 }
 
 static const char *
@@ -1089,10 +1173,38 @@ dpg_cksum(void *data, int len)
 	return reduced;
 }
 
-static void
-dpg_norm2(char *buf, double val, char *fmt, int normalize)
+static uint64_t
+dpg_ipv4_pseudo_cksum(struct dpg_ipv4_hdr *ih, int len)
+{	
+	uint64_t sum;
+	struct dpg_ipv4_pseudo_hdr pseudo;
+
+	pseudo.src = ih->src_addr;
+	pseudo.dst = ih->dst_addr;
+	pseudo.pad = 0;
+	pseudo.proto = ih->next_proto_id;
+	pseudo.len = rte_cpu_to_be_16(len);
+	sum = dpg_cksum_raw(&pseudo, sizeof(pseudo));
+	return sum;
+}
+
+static uint16_t
+dpg_ipv4_udp_cksum(struct dpg_ipv4_hdr *ih, void *l4_hdr, int len)
 {
-	char *units[] = { "", "k", "m", "g", "t" };
+	uint16_t reduced;
+	uint64_t sum, pseudo_sum;
+
+	sum = dpg_cksum_raw(l4_hdr, len);
+	pseudo_sum = dpg_ipv4_pseudo_cksum(ih, len);
+	sum = dpg_cksum_add(sum, pseudo_sum);
+	reduced = dpg_cksum_reduce(sum);
+	return reduced;
+}
+
+static void
+dpg_print_human_readable5(char *buf, size_t count, double val, char *fmt, int normalize)
+{
+	static const char *units[] = { "", "k", "m", "g", "t" };
 	int i;
 
 	if (normalize) {
@@ -1103,15 +1215,15 @@ dpg_norm2(char *buf, double val, char *fmt, int normalize)
 		i = 0;
 	}
 
-	sprintf(buf, fmt, val, units[i]);
+	snprintf(buf, count, fmt, val, units[i]);
 }
 
 static int64_t
-dpg_unnorm(const char *s)
+dpg_parse_human_readable(const char *s)
 {
 	double val;
 	char *endptr, *unit;
-	const char *units = "kmgt";
+	static const char *units = "kmgt";
 
 	val = strtod(s, &endptr);
 	if (*endptr == '\0') {
@@ -1126,12 +1238,12 @@ dpg_unnorm(const char *s)
 }
 
 static void
-dpg_norm(char *buf, double val, int normalize)
+dpg_print_human_readable(char *buf, size_t count, double val, int normalize)
 {
 	if (normalize) {
-		dpg_norm2(buf, val, "%.3f%s", normalize);
+		dpg_print_human_readable5(buf, count, val, "%.3f%s", normalize);
 	} else {
-		dpg_norm2(buf, val, "%.0f%s", normalize);
+		dpg_print_human_readable5(buf, count, val, "%.0f%s", normalize);
 	}
 }
 
@@ -1139,156 +1251,6 @@ static const char *
 dpg_icmp_type_string(int icmp_type)
 {
 	return icmp_type == DPG_IP_ICMP_ECHO_REQUEST ? "request" : "reply";
-}
-
-static void
-dpg_log_port(struct dpg_port *port, struct dpg_strbuf *sb)
-{
-	char port_name[RTE_ETH_NAME_MAX_LEN];
-
-	rte_eth_dev_get_name_by_port(port->id, port_name);
-
-	dpg_strbuf_adds(sb, port_name);
-}
-
-static void
-dpg_log_hwaddr(struct dpg_port *port, struct dpg_strbuf *sb, struct dpg_eth_hdr *eh)
-{
-	char shbuf[DPG_ETH_ADDRSTRLEN];
-	char dhbuf[DPG_ETH_ADDRSTRLEN];
-
-	if (port->verbose[DPG_RX] < 2 || eh == NULL) {
-		return;
-	}
-
-	dpg_eth_format_addr(shbuf, sizeof(shbuf), &eh->src_addr);
-	dpg_eth_format_addr(dhbuf, sizeof(dhbuf), &eh->dst_addr);
-
-	dpg_strbuf_addf(sb, " %s->%s", shbuf, dhbuf);
-}
-
-static void
-dpg_log_icmp(struct dpg_port *port, int dir, struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr *ih6,
-		struct dpg_ipv4_hdr *ih, struct dpg_icmp_hdr *ich)
-{
-	char sabuf[INET6_ADDRSTRLEN];
-	char dabuf[INET6_ADDRSTRLEN];
-	char logbuf[DPG_LOG_BUFSIZE];
-	struct dpg_strbuf sb;
-
-	if (!port->verbose[dir]) {
-		return;
-	}
-
-	dpg_strbuf_init(&sb, logbuf, sizeof(logbuf));
-
-	dpg_log_port(port, &sb);
-	dpg_log_hwaddr(port, &sb, eh);
-
-	dpg_strbuf_addf(&sb, ": %s ", dir == DPG_TX ? "Sent" : "Recv");
-	if (ih6 != NULL) {
-		inet_ntop(AF_INET6, &ih6->src_addr, sabuf, sizeof(sabuf));
-		inet_ntop(AF_INET6, &ih6->dst_addr, dabuf, sizeof(dabuf));
-		dpg_strbuf_addf(&sb, "%s->%s\n\t", sabuf, dabuf);
-	}
-
-	inet_ntop(AF_INET, &ih->src_addr, sabuf, sizeof(sabuf));
-	inet_ntop(AF_INET, &ih->dst_addr, dabuf, sizeof(dabuf));
-
-	dpg_strbuf_addf(&sb, "ICMP echo %s: %s->%s, id=%d, seq=%d",
-			dpg_icmp_type_string(ich->icmp_type),
-			sabuf, dabuf,
-			rte_be_to_cpu_16(ich->icmp_ident),
-			rte_be_to_cpu_16(ich->icmp_seq_nb));
-
-	printf("%s\n", dpg_strbuf_cstr(&sb));
-}
-
-static void
-dpg_log_arp(struct dpg_port *port, int dir, struct dpg_eth_hdr *eh, struct dpg_arp_hdr *ah)
-{
-	int is_req;
-	char tibuf[INET_ADDRSTRLEN];
-	char sibuf[INET_ADDRSTRLEN];
-	char thbuf[DPG_ETH_ADDRSTRLEN];
-	char shbuf[DPG_ETH_ADDRSTRLEN];
-	char logbuf[DPG_LOG_BUFSIZE];
-	struct dpg_strbuf sb;
-
-	if (!port->verbose[dir]) {
-		return;
-	}
-
-	dpg_strbuf_init(&sb, logbuf, sizeof(logbuf));
-
-	dpg_log_port(port, &sb);
-	dpg_log_hwaddr(port, &sb, eh);
-
-	is_req = ah->arp_opcode == RTE_BE16(DPG_ARP_OP_REQUEST);
-	inet_ntop(AF_INET, &ah->arp_tip, tibuf, sizeof(tibuf));
-	inet_ntop(AF_INET, &ah->arp_sip, sibuf, sizeof(sibuf));
-	dpg_eth_format_addr(thbuf, sizeof(thbuf), &ah->arp_tha);
-	dpg_eth_format_addr(shbuf, sizeof(shbuf), &ah->arp_sha);
-
-	dpg_strbuf_addf(&sb, ": %s ARP %s %s(%s)->%s(%s)",
-			dir == DPG_TX ? "Sent" : "Recv",
-			is_req ? "request" : "reply",
-			sibuf, shbuf, tibuf, thbuf);
-
-	printf("%s\n", dpg_strbuf_cstr(&sb));
-}
-
-static void
-dpg_log_ipv6(struct dpg_port *port, int dir, struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr *ih,
-		const char *desc)
-{
-	char srcbuf[INET6_ADDRSTRLEN];
-	char dstbuf[INET6_ADDRSTRLEN];
-	char logbuf[DPG_LOG_BUFSIZE];
-	struct dpg_strbuf sb;
-
-	if (!port->verbose[dir]) {
-		return;
-	}
-
-	dpg_strbuf_init(&sb, logbuf, sizeof(logbuf));
-
-	dpg_log_port(port, &sb);
-	dpg_log_hwaddr(port, &sb, eh);
-
-	inet_ntop(AF_INET6, ih->src_addr, srcbuf, sizeof(srcbuf));
-	inet_ntop(AF_INET6, ih->dst_addr, dstbuf, sizeof(dstbuf));
-
-	dpg_strbuf_addf(&sb, ": %s %s->%s: %s", dir == DPG_RX ? "Recv" : "Sent",
-			srcbuf, dstbuf, desc);
-
-	printf("%s\n", dpg_strbuf_cstr(&sb));
-}
-
-static void
-dpg_log_custom(struct dpg_port *port, struct dpg_eth_hdr *eh, const char *proto)
-{
-	char logbuf[DPG_LOG_BUFSIZE];
-	struct dpg_strbuf sb;
-
-	if (!port->verbose[DPG_RX]) {
-		return;
-	}
-
-	dpg_strbuf_init(&sb, logbuf, sizeof(logbuf));
-
-	dpg_log_port(port, &sb);
-	dpg_log_hwaddr(port, &sb, eh);
-
-	dpg_strbuf_addf(&sb, ": Recv %s packet", proto);
-
-	printf("%s\n", dpg_strbuf_cstr(&sb));
-}
-
-static uint64_t
-dpg_rdtsc(void)
-{
-	return g_dpg_lcores[rte_lcore_id()].tsc;
 }
 
 static struct dpg_port *
@@ -1300,6 +1262,173 @@ dpg_port_get(int port_id)
 	assert(port != NULL);
 
 	return port;
+}
+
+static void
+dpg_log_rxtx(struct dpg_strbuf *sb,  struct dpg_task *task, struct dpg_eth_hdr *eh, int dir)
+{
+	char port_name[RTE_ETH_NAME_MAX_LEN];
+	char shbuf[DPG_ETH_ADDRSTRLEN];
+	char dhbuf[DPG_ETH_ADDRSTRLEN];
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->port_id);
+
+	dpg_strbuf_adds(sb, dir == DPG_RX ? "RX ": "TX ");
+
+	rte_eth_dev_get_name_by_port(port->id, port_name);
+	dpg_strbuf_adds(sb, port_name);
+	dpg_strbuf_adds(sb, " ");
+	if (dir != DPG_RX || port->verbose[DPG_RX] < 1) {
+		return;
+	}
+	if (port->n_queues > 1) {
+		dpg_strbuf_addf(sb, "(q=%d) ", task->queue_id);
+	}
+
+//	if (eh != NULL) {
+	dpg_eth_format_addr(shbuf, sizeof(shbuf), &eh->src_addr);
+	dpg_eth_format_addr(dhbuf, sizeof(dhbuf), &eh->dst_addr);
+	dpg_strbuf_addf(sb, "%s->%s ", shbuf, dhbuf);
+}
+
+static void
+dpg_log_packet(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr *ih6,
+		struct dpg_ipv4_hdr *ih, void *l4_hdr)
+{
+	char sabuf[INET6_ADDRSTRLEN];
+	char dabuf[INET6_ADDRSTRLEN];
+	char logbuf[DPG_LOG_BUFSIZE];
+	struct dpg_strbuf sb;
+	struct dpg_port *port;
+	struct dpg_icmp_hdr *ich;
+	struct dpg_udp_hdr *uh;
+
+	port = dpg_port_get(task->port_id);
+	if (!port->verbose[dir]) {
+		return;
+	}
+
+	dpg_strbuf_init(&sb, logbuf, sizeof(logbuf));
+
+	dpg_log_rxtx(&sb, task, eh, dir);
+
+	if (ih6 != NULL) {
+		inet_ntop(AF_INET6, &ih6->src_addr, sabuf, sizeof(sabuf));
+		inet_ntop(AF_INET6, &ih6->dst_addr, dabuf, sizeof(dabuf));
+		dpg_strbuf_addf(&sb, "%s->%s\n\t", sabuf, dabuf);
+	}
+
+	inet_ntop(AF_INET, &ih->src_addr, sabuf, sizeof(sabuf));
+	inet_ntop(AF_INET, &ih->dst_addr, dabuf, sizeof(dabuf));
+
+	switch (ih->next_proto_id) {
+	case IPPROTO_ICMP:
+		ich = l4_hdr;
+		dpg_strbuf_addf(&sb, "ICMP echo %s: %s->%s, id=%d, seq=%d",
+				dpg_icmp_type_string(ich->icmp_type),
+				sabuf, dabuf,
+				rte_be_to_cpu_16(ich->icmp_ident),
+				rte_be_to_cpu_16(ich->icmp_seq_nb));
+		break;
+
+	case IPPROTO_UDP:
+		uh = l4_hdr;
+		dpg_strbuf_addf(&sb, "UDP %s:%hu->%s:%hu",
+				sabuf, rte_be_to_cpu_16(uh->src_port),
+				dabuf, rte_be_to_cpu_16(uh->dst_port));
+		break;
+	}
+
+	printf("%s\n", dpg_strbuf_cstr(&sb));
+}
+
+static void
+dpg_log_arp(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_arp_hdr *ah)
+{
+	int is_req;
+	char tibuf[INET_ADDRSTRLEN];
+	char sibuf[INET_ADDRSTRLEN];
+	char thbuf[DPG_ETH_ADDRSTRLEN];
+	char shbuf[DPG_ETH_ADDRSTRLEN];
+	char logbuf[DPG_LOG_BUFSIZE];
+	struct dpg_strbuf sb;
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->port_id);
+	if (!port->verbose[dir]) {
+		return;
+	}
+
+	dpg_strbuf_init(&sb, logbuf, sizeof(logbuf));
+
+	dpg_log_rxtx(&sb, task, eh, dir);
+
+	is_req = ah->arp_opcode == RTE_BE16(DPG_ARP_OP_REQUEST);
+	inet_ntop(AF_INET, &ah->arp_tip, tibuf, sizeof(tibuf));
+	inet_ntop(AF_INET, &ah->arp_sip, sibuf, sizeof(sibuf));
+	dpg_eth_format_addr(thbuf, sizeof(thbuf), &ah->arp_tha);
+	dpg_eth_format_addr(shbuf, sizeof(shbuf), &ah->arp_sha);
+
+	dpg_strbuf_addf(&sb, ": ARP %s %s(%s)->%s(%s)",
+			is_req ? "request" : "reply",
+			sibuf, shbuf, tibuf, thbuf);
+
+	printf("%s\n", dpg_strbuf_cstr(&sb));
+}
+
+static void
+dpg_log_ipv6(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr *ih,
+		const char *desc)
+{
+	char srcbuf[INET6_ADDRSTRLEN];
+	char dstbuf[INET6_ADDRSTRLEN];
+	char logbuf[DPG_LOG_BUFSIZE];
+	struct dpg_strbuf sb;
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->port_id);
+	if (!port->verbose[dir]) {
+		return;
+	}
+
+	dpg_strbuf_init(&sb, logbuf, sizeof(logbuf));
+
+	dpg_log_rxtx(&sb, task, eh, dir);
+
+	inet_ntop(AF_INET6, ih->src_addr, srcbuf, sizeof(srcbuf));
+	inet_ntop(AF_INET6, ih->dst_addr, dstbuf, sizeof(dstbuf));
+
+	dpg_strbuf_addf(&sb, ": %s->%s: %s", srcbuf, dstbuf, desc);
+
+	printf("%s\n", dpg_strbuf_cstr(&sb));
+}
+
+static void
+dpg_log_custom(struct dpg_task *task, struct dpg_eth_hdr *eh, const char *proto)
+{
+	char logbuf[DPG_LOG_BUFSIZE];
+	struct dpg_strbuf sb;
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->port_id);
+	if (!port->verbose[DPG_RX]) {
+		return;
+	}
+
+	dpg_strbuf_init(&sb, logbuf, sizeof(logbuf));
+
+	dpg_log_rxtx(&sb, task, eh, DPG_RX);
+
+	dpg_strbuf_addf(&sb, ": %s packet", proto);
+
+	printf("%s\n", dpg_strbuf_cstr(&sb));
+}
+
+static uint64_t
+dpg_rdtsc(void)
+{
+	return g_dpg_lcores[rte_lcore_id()].tsc;
 }
 
 static int
@@ -1339,7 +1468,7 @@ dpg_container_parse_ipv6(char *str, struct dpg_container *c)
 }
 
 static void
-dpg_add_session_field(struct dpg_port *port, int field_id)
+dpg_del_session_field(struct dpg_port *port, int field_id)
 {
 	struct dpg_container *field;
 
@@ -1348,6 +1477,16 @@ dpg_add_session_field(struct dpg_port *port, int field_id)
 		DPG_DLIST_REMOVE(field, list);
 		field->list.dls_next = NULL;
 	}
+}
+
+static void
+dpg_add_session_field(struct dpg_port *port, int field_id)
+{
+	struct dpg_container *field;
+
+	dpg_del_session_field(port, field_id);
+
+	field = port->session_field + field_id;
 	DPG_DLIST_INSERT_TAIL(&port->session_field_head, field, list);
 }
 
@@ -1362,6 +1501,7 @@ dpg_create_port(void)
 	port->id = RTE_MAX_ETHPORTS;
 	port->rps_max = DPG_DEFAULT_RPS;
 	port->pkt_len = DPG_DEFAULT_PKT_LEN;
+	port->proto = IPPROTO_ICMP;
 
 	port->no_drop = DPG_DEFAULT_NO_DROP;
 	port->no_drop_percent = DPG_DEFAULT_NO_DROP_PERCENT;
@@ -1377,9 +1517,15 @@ dpg_create_port(void)
 
 	dpg_container_parse_ipv4(DPG_DEFAULT_SRC_IP, &port->session_field[DPG_SESSION_SRC_IP]);
 	dpg_container_parse_ipv4(DPG_DEFAULT_DST_IP, &port->session_field[DPG_SESSION_DST_IP]);
+
+	dpg_container_parse_u16(DPG_DEFAULT_SRC_PORT, &port->session_field[DPG_SESSION_SRC_PORT]);
+	dpg_container_parse_u16(DPG_DEFAULT_DST_PORT, &port->session_field[DPG_SESSION_DST_PORT]);
+
 	dpg_container_parse_u16(DPG_DEFAULT_ICMP_ID, &port->session_field[DPG_SESSION_ICMP_ID]);
 	dpg_container_parse_u16(DPG_DEFAULT_ICMP_SEQ, &port->session_field[DPG_SESSION_ICMP_SEQ]);
 
+	dpg_add_session_field(port, DPG_SESSION_SRC_PORT);
+	dpg_add_session_field(port, DPG_SESSION_DST_PORT);
 	dpg_add_session_field(port, DPG_SESSION_ICMP_ID);
 	dpg_add_session_field(port, DPG_SESSION_SRC_IP);
 	dpg_add_session_field(port, DPG_SESSION_DST_IP);
@@ -1389,32 +1535,81 @@ dpg_create_port(void)
 }
 
 static void
-dpg_create_task(uint16_t port_id, uint16_t lcore_id, uint16_t queue_id)
+dpg_set_rand_seed(struct dpg_port *port, uint32_t seed)
+{
+	port->rand_seed = (seed << 8) & 0xffffff00;
+}
+
+static void
+dpg_set_rand(struct dpg_port *port)
+{
+	port->rand = true;
+	if (port->rand_seed == 0) {
+		dpg_set_rand_seed(port, time(NULL) ^ getpid());
+	}
+}
+
+static void
+dpg_set_task_rand_session_count(struct dpg_task *task)
+{
+	uint32_t sum;
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->port_id);
+
+	task->rand_session_count = DPG_MAX(1, port->rand_session_count / port->n_queues);
+	if (task->queue_id != 0) {
+		return;
+	}
+
+	sum = task->rand_session_count * port->n_queues;
+	if (sum >= port->rand_session_count) {
+		return;
+	}
+
+	task->rand_session_count += port->rand_session_count - sum;
+}
+
+static void
+dpg_create_task(struct dpg_port *port, uint16_t lcore_id, uint16_t queue_id)
 {
 	int field_id;
-	struct dpg_port *port;
+	bool first;
 	struct dpg_lcore *lcore;
 	struct dpg_task *task;
 	struct dpg_container *ct;
 	struct dpg_iterator *it;
 
-	port = dpg_port_get(port_id);
 	lcore = g_dpg_lcores + lcore_id;
 
 	task = dpg_xmalloc(sizeof(*task));
 	memset(task, 0, sizeof(*task));
 
-	task->port_id = port_id;
+	task->port_id = port->id;
 	task->lcore_id = lcore_id;
 	task->queue_id = queue_id;
 
 	dpg_dlist_init(&task->session_field_head);
 
+	first = true;
 	DPG_DLIST_FOREACH(ct, &port->session_field_head, list) {
 		field_id = ct - port->session_field;
 		it = task->session_field + field_id;
-		dpg_iterator_init(it, ct, port->n_queues, queue_id);
+		if (first) {
+			dpg_iterator_init(it, ct, port->n_queues, queue_id);
+			first = false;
+		} else {
+			dpg_iterator_init(it, ct, 1, 0);
+		}
 		DPG_DLIST_INSERT_TAIL(&task->session_field_head, it, list);
+	}
+
+	if (port->rand) {
+		task->rand_seed = port->rand_seed | task->queue_id;
+		task->rand_state = task->rand_seed;
+		if (port->rand_session_count) {
+			dpg_set_task_rand_session_count(task);
+		}
 	}
 
 	DPG_DLIST_INSERT_HEAD(&lcore->task_head, task, llist);
@@ -1430,7 +1625,7 @@ dpg_print_usage(void)
 	char eth_addr_buf[DPG_ETH_ADDRSTRLEN];
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 
-	dpg_norm(rate_buf, DPG_DEFAULT_RPS, 1);
+	dpg_print_human_readable(rate_buf, sizeof(rate_buf), DPG_DEFAULT_RPS, 1);
 
 	printf("Usage: dpdk-ping [DPDK options] -- port options [-- port options ...]\n"
 	"\n"
@@ -1448,6 +1643,8 @@ dpg_print_usage(void)
 	"\t-H {ether address}:  Destination ethernet address (default: ff:ff:ff:ff:ff:ff)\n"
 	"\t-s {IP..}:  Source ip addresses iterator (default: %s)\n"
 	"\t-d {IP..}:  Destination ip addresses iterator (default: %s)\n"
+	"\t-S {port..}:  Source port iterator (default: %s)\n"
+	"\t-D {port..}:  Destination port iterator (default: %s)\n"
 	"\t-L {bytes}:  Packet size (default: %d)\n"
 	"\t--rx-verbose {level}:  Be verbose on rx path (default: %d)\n"
 	"\t--tx-verbose {level}:  Be verbose on tx path (default: %d)\n"
@@ -1465,6 +1662,8 @@ dpg_print_usage(void)
 		rate_buf,
 		DPG_DEFAULT_SRC_IP,
 		DPG_DEFAULT_DST_IP,
+		DPG_DEFAULT_SRC_PORT,
+		DPG_DEFAULT_DST_PORT,
 		DPG_DEFAULT_PKT_LEN,
 		0,
 		0,
@@ -1507,12 +1706,17 @@ dpg_parse_port(int argc, char **argv)
 		{ "help", no_argument, 0, 'h' },
 		{ "rx-verbose", required_argument, 0, 0 },
 		{ "tx-verbose", required_argument, 0, 0 },
+		{ "udp", no_argument, 0, 0 },
+		{ "icmp", no_argument, 0, 0 },
 		{ "icmp-id", required_argument, 0, 0 },
 		{ "icmp-seq", required_argument, 0, 0 },
 		{ "srv6-src", required_argument, 0, 0 },
 		{ "srv6-dst", required_argument, 0, 0 },
 		{ "software-counters", required_argument, 0, 0 },
 		{ "no-drop",  required_argument, 0, 0 },
+		{ "rand", no_argument, 0, 0 },
+		{ "rand-seed", required_argument, 0, 0 },
+		{ "rand-sessions", required_argument, 0, 0 },
 		{ NULL, 0, 0, 0 },
 	};
 
@@ -1520,7 +1724,7 @@ dpg_parse_port(int argc, char **argv)
 
 	port = dpg_create_port();
 
-	while ((opt = getopt_long(argc, argv, "hV:b:l:p:R:E:4:6:B:H:s:d:L:",
+	while ((opt = getopt_long(argc, argv, "hV:b:l:p:R:E:4:6:B:H:s:d:S:D:L:",
 			long_options, &option_index)) != -1) {
 		switch (opt) {
 		case 0:
@@ -1529,6 +1733,10 @@ dpg_parse_port(int argc, char **argv)
 				port->verbose[DPG_RX] = strtoul(optarg, NULL, 10);
 			} else if (!strcmp(optname, "tx-verbose")) {
 				port->verbose[DPG_TX] = strtoul(optarg, NULL, 10);
+			} else if (!strcmp(optname, "udp")) {
+				port->proto = IPPROTO_UDP;
+			} else if (!strcmp(optname, "icmp")) {
+				port->proto = IPPROTO_ICMP;
 			} else if (!strcmp(optname, "icmp-id")) {
 				ct = port->session_field + DPG_SESSION_ICMP_ID;
 				rc = dpg_container_parse_u16(optarg, ct);
@@ -1583,6 +1791,18 @@ dpg_parse_port(int argc, char **argv)
 				}
 
 				port->no_drop = true;
+			} else if (!strcmp(optname, "rand")) {
+				dpg_set_rand(port);
+			} else if (!strcmp(optname, "rand-seed")) {
+				port->rand = true;
+				dpg_set_rand_seed(port, strtoul(optarg, NULL, 10));
+			} else if (!strcmp(optname, "rand-sessions")) {
+				dpg_set_rand(port);
+				rc = dpg_parse_human_readable(optarg);
+				if (rc < 0) {
+					dpg_invalid_argument(0, optname);
+				}
+				port->rand_session_count = rc;
 			}
 			break;
 
@@ -1661,7 +1881,7 @@ dpg_parse_port(int argc, char **argv)
 			break;
 
 		case 'B':
-			rc = dpg_unnorm(optarg);
+			rc = dpg_parse_human_readable(optarg);
 			if (rc < 0) {
 				dpg_invalid_argument(opt, NULL);
 			}
@@ -1691,6 +1911,24 @@ dpg_parse_port(int argc, char **argv)
 				dpg_invalid_argument(opt, NULL);
 			}
 			dpg_add_session_field(port, DPG_SESSION_DST_IP);
+			break;
+
+		case 'S':
+			ct = port->session_field + DPG_SESSION_SRC_PORT;
+			rc = dpg_container_parse_u16(optarg, ct);
+			if (rc < 0) {
+				dpg_invalid_argument(opt, NULL);
+			}
+			dpg_add_session_field(port, DPG_SESSION_SRC_PORT);
+			break;
+
+		case 'D':
+			ct = port->session_field + DPG_SESSION_DST_PORT;
+			rc = dpg_container_parse_u16(optarg, ct);
+			if (rc < 0) {
+				dpg_invalid_argument(opt, NULL);
+			}
+			dpg_add_session_field(port, DPG_SESSION_DST_PORT);
 			break;
 
 		case 'L':
@@ -1728,9 +1966,17 @@ dpg_parse_port(int argc, char **argv)
 		}
 	}
 
+	if (port->proto == IPPROTO_ICMP) {
+		dpg_del_session_field(port, DPG_SESSION_SRC_PORT);
+		dpg_del_session_field(port, DPG_SESSION_DST_PORT);
+	} else {
+		dpg_del_session_field(port, DPG_SESSION_ICMP_ID);
+		dpg_del_session_field(port, DPG_SESSION_ICMP_SEQ);
+	}
+
 	for (i = 0; i < lcores.size; ++i) {
 		lcore_id = dpg_container_get(&lcores, i);
-		dpg_create_task(port->id, lcore_id, i);
+		dpg_create_task(port, lcore_id, i);
 	}
 
 	return optind;
@@ -1747,26 +1993,45 @@ static void
 dpg_next_session(struct dpg_task *task)
 {
 	bool overflow;
+	uint32_t r;
 	struct dpg_iterator *it;
+	struct dpg_port *port;
 
-	DPG_DLIST_FOREACH(it, &task->session_field_head, list) {
-		overflow = dpg_iterator_next(it);
-		if (!overflow) {
-			break;
+	port = dpg_port_get(task->port_id);
+	if (port->rand) {
+		r = dpg_rand_xorshift(&task->rand_state);
+		DPG_DLIST_FOREACH(it, &task->session_field_head, list) {
+			dpg_iterator_set_rand(it, r);
+		}
+
+		if (task->rand_session_count) {
+			task->rand_session_index++;
+			if (task->rand_session_index == task->rand_session_count) {
+				task->rand_session_index = 0;
+				task->rand_state = task->rand_seed;
+			}
+		}
+	} else {
+		DPG_DLIST_FOREACH(it, &task->session_field_head, list) {
+			overflow = dpg_iterator_next(it);
+			if (!overflow) {
+				break;
+			}
 		}
 	}
 }
 
 static struct rte_mbuf *
-dpg_create_icmp_request(struct dpg_task *task)
+dpg_create_request(struct dpg_task *task)
 {
-	int ih_total_length, pkt_len;
-	dpg_uint128_t srv6_dst, src_ip, dst_ip, icmp_id, icmp_seq;
+	int ih_total_length;
+	dpg_uint128_t srv6_dst, src_ip, dst_ip, src_port, dst_port, icmp_id, icmp_seq;
 	struct rte_mbuf *m;
 	struct dpg_eth_hdr *eh;
 	struct dpg_ipv4_hdr *ih;
 	struct dpg_ipv6_hdr *ih6;
 	struct dpg_icmp_hdr *ich;
+	struct dpg_udp_hdr *uh;
 	struct dpg_srv6_hdr *srh;
 	struct dpg_port *port;
 	struct dpg_iterator *field;
@@ -1780,12 +2045,22 @@ dpg_create_icmp_request(struct dpg_task *task)
 
 	eh = rte_pktmbuf_mtod(m, struct dpg_eth_hdr *);
 
-	pkt_len = sizeof(*eh) + sizeof(*ih) + sizeof(*ich);
+	m->pkt_len = sizeof(*eh) + sizeof(*ih);
+	switch (port->proto) {
+	case IPPROTO_ICMP:
+		m->pkt_len += sizeof(*ich);
+		break;
+
+	default:
+		// UDP
+		m->pkt_len += sizeof(*uh) + sizeof(DPG_UDP_DATA_PING);
+		break;
+	}
 
 	if (port->srv6) {
-		pkt_len += sizeof(*ih6) + sizeof(*srh);
+		m->pkt_len += sizeof(*ih6) + sizeof(*srh);
 
-		m->pkt_len = DPG_MAX(port->pkt_len, pkt_len);
+		m->pkt_len = DPG_MAX(port->pkt_len, m->pkt_len);
 		ih_total_length = m->pkt_len - (sizeof(*eh) + sizeof(*ih6) + sizeof(*srh));
 
 		eh->eth_type = RTE_BE16(DPG_ETH_TYPE_IPV6);
@@ -1812,7 +2087,7 @@ dpg_create_icmp_request(struct dpg_task *task)
 		srh->tag = 0;
 		memcpy(srh->localsid, ih6->dst_addr, DPG_IPV6_ADDR_SIZE);
 	} else {
-		m->pkt_len = DPG_MAX(port->pkt_len, pkt_len);
+		m->pkt_len = DPG_MAX(port->pkt_len, m->pkt_len);
 		ih_total_length = m->pkt_len - sizeof(*eh);
 
 		eh->eth_type = RTE_BE16(DPG_ETH_TYPE_IPV4);
@@ -1824,8 +2099,6 @@ dpg_create_icmp_request(struct dpg_task *task)
 	m->next = NULL;
 	m->data_len = m->pkt_len;
 
-	ich = (struct dpg_icmp_hdr *)(ih + 1);
-
 	dpg_set_eth_hdr_addresses(port, eh);
 
 	ih->version = 4;
@@ -1835,7 +2108,7 @@ dpg_create_icmp_request(struct dpg_task *task)
 	ih->packet_id = 0;
 	ih->fragment_offset = 0;
 	ih->time_to_live = 64;
-	ih->next_proto_id = IPPROTO_ICMP;
+	ih->next_proto_id = port->proto;
 	ih->hdr_checksum = 0;
 
 	field = task->session_field + DPG_SESSION_SRC_IP;
@@ -1846,35 +2119,64 @@ dpg_create_icmp_request(struct dpg_task *task)
 	dst_ip = dpg_iterator_get(field);
 	ih->dst_addr = rte_cpu_to_be_32(dst_ip);
 
-	ich->icmp_type = DPG_IP_ICMP_ECHO_REQUEST;
-	ich->icmp_code = 0;
-	ich->icmp_cksum = 0;
-
-	field = task->session_field + DPG_SESSION_ICMP_ID;
-	icmp_id = dpg_iterator_get(field);
-	ich->icmp_ident = rte_cpu_to_be_16(icmp_id);
-
-	field = task->session_field + DPG_SESSION_ICMP_SEQ;
-	icmp_seq = dpg_iterator_get(field);
-	ich->icmp_seq_nb = rte_cpu_to_be_16(icmp_seq);
-
 	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
-	ich->icmp_cksum = dpg_cksum(ich, ih_total_length - sizeof(*ih));
+
+	switch (port->proto) {
+	case IPPROTO_ICMP:
+		ich = (struct dpg_icmp_hdr *)(ih + 1);
+		ich->icmp_type = DPG_IP_ICMP_ECHO_REQUEST;
+		ich->icmp_code = 0;
+		ich->icmp_cksum = 0;
+
+		field = task->session_field + DPG_SESSION_ICMP_ID;
+		icmp_id = dpg_iterator_get(field);
+		ich->icmp_ident = rte_cpu_to_be_16(icmp_id);
+
+		field = task->session_field + DPG_SESSION_ICMP_SEQ;
+		icmp_seq = dpg_iterator_get(field);
+		ich->icmp_seq_nb = rte_cpu_to_be_16(icmp_seq);
+
+		ich->icmp_cksum = dpg_cksum(ich, ih_total_length - sizeof(*ih));
+		break;
+
+	default:
+		// UDP
+		uh = (struct dpg_udp_hdr *)(ih + 1);
+
+		field = task->session_field + DPG_SESSION_SRC_PORT;
+		src_port = dpg_iterator_get(field);
+		uh->src_port = rte_cpu_to_be_16(src_port);
+
+		field = task->session_field + DPG_SESSION_DST_PORT;
+		dst_port = dpg_iterator_get(field);
+		uh->dst_port = rte_cpu_to_be_16(dst_port);
+
+		uh->dgram_len = rte_cpu_to_be_16(ih_total_length - sizeof(*ih));
+		uh->dgram_cksum = 0;
+		memcpy(uh + 1, DPG_UDP_DATA_PING, sizeof(DPG_UDP_DATA_PING));
+		uh->dgram_cksum = dpg_ipv4_udp_cksum(ih, uh, ih_total_length - sizeof(*ih));
+		break;
+	}
 
 	dpg_next_session(task);
 
-	dpg_log_icmp(port, DPG_TX, NULL, ih6, ih, ich);
+	dpg_log_packet(task, DPG_TX, NULL, ih6, ih, ih + 1);
 
 	return m;
 }
 
 static int
-dpg_ip_input(struct dpg_port *port, struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr *ih6,
+dpg_ip_input(struct dpg_task *task, struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr *ih6,
 		void *ptr, int len)
 {
 	int hl, ih_total_length;
+	void *l4_hdr;
 	struct dpg_ipv4_hdr *ih;
 	struct dpg_icmp_hdr *ich;
+	struct dpg_udp_hdr *uh;
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->port_id);
 
 	ih = ptr;
 	if (len < sizeof(*ih)) {
@@ -1890,37 +2192,69 @@ dpg_ip_input(struct dpg_port *port, struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr 
 		return -EINVAL;
 	}
 
-	if (ih->next_proto_id != IPPROTO_ICMP) {
-		return -EINVAL;
-	}
-
-	if (len < hl + sizeof(*ich)) {
-		return -EINVAL;
-	}
-
 	ih_total_length = rte_be_to_cpu_16(ih->total_length);
 
 	if (ih_total_length > len) {
 		return -EINVAL;
-	} 
+	}
 
-	ich = (struct dpg_icmp_hdr *)((uint8_t *)ih + hl);
+	l4_hdr = (uint8_t *)ih + hl;
 
-	dpg_log_icmp(port, DPG_RX, eh, ih6, ih, ich);
+	dpg_log_packet(task, DPG_RX, eh, ih6, ih, l4_hdr);
 
-	if (ich->icmp_type != DPG_IP_ICMP_ECHO_REQUEST || !port->Eflag || ih6 != NULL) {
+	if (!port->Eflag || ih6 != NULL) {
 		return -ENOTSUP;
 	}
 
-	ich->icmp_type = DPG_IP_ICMP_ECHO_REPLY;
-	DPG_SWAP(ih->src_addr, ih->dst_addr);
+	switch (ih->next_proto_id) {
+	case IPPROTO_ICMP:
+		if (ih_total_length < hl + sizeof(*ich)) {
+			return -EINVAL;
+		}
 
-	ich->icmp_cksum = 0;
-	ich->icmp_cksum = dpg_cksum(ich, ih_total_length - hl);
+		ich = (struct dpg_icmp_hdr *)l4_hdr;
+
+		if (ich->icmp_type != DPG_IP_ICMP_ECHO_REQUEST) {
+			return -ENOTSUP;
+		}
+
+		ich->icmp_type = DPG_IP_ICMP_ECHO_REPLY;
+		DPG_SWAP(ih->src_addr, ih->dst_addr);
+
+		ich->icmp_cksum = 0;
+		ich->icmp_cksum = dpg_cksum(ich, ih_total_length - hl);
+		break;
+
+	case IPPROTO_UDP:
+		if (ih_total_length < hl + sizeof(*uh)) {
+			return -EINVAL;
+		}
+
+		if (ih_total_length < hl + sizeof(*uh) + sizeof(DPG_UDP_DATA_PING)) {
+			return -ENOTSUP;
+		}
+
+		uh = (struct dpg_udp_hdr *)l4_hdr;
+	
+		if (memcmp(uh + 1, DPG_UDP_DATA_PING, sizeof(DPG_UDP_DATA_PING))) {
+			return -ENOTSUP;
+		}
+
+		DPG_SWAP(uh->src_port, uh->dst_port);
+		memcpy(uh + 1, DPG_UDP_DATA_PONG, sizeof(DPG_UDP_DATA_PONG));
+		uh->dgram_cksum = 0;
+		uh->dgram_cksum = dpg_ipv4_udp_cksum(ih, uh, ih_total_length - hl);
+		break;
+
+	default:
+		return -ENOTSUP;
+	}
+
+	DPG_SWAP(ih->src_addr, ih->dst_addr);
 	ih->hdr_checksum = 0;
 	ih->hdr_checksum = dpg_cksum(ih, hl);
 
-	dpg_log_icmp(port, DPG_TX, NULL, ih6, ih, ich);
+	dpg_log_packet(task, DPG_TX, NULL, ih6, ih, l4_hdr);
 
 	return 0;
 }
@@ -1934,7 +2268,7 @@ dpg_create_neighbour_advertisment(struct dpg_port *port, struct rte_mbuf *m,
 	uint8_t target[DPG_IPV6_ADDR_SIZE];
 	struct dpg_icmpv6_neigh_advertisment *na;
 	struct dpg_target_link_layer_address_option *opt;
-	struct dpg_ipv6_pseudohdr pseudo;
+	struct dpg_ipv6_pseudo_hdr pseudo;
 
 	len = sizeof(*na) + sizeof(*opt);
 	m->pkt_len = m->data_len = sizeof(struct dpg_eth_hdr) + sizeof(*ih) + len;
@@ -1972,7 +2306,7 @@ dpg_create_neighbour_advertisment(struct dpg_port *port, struct rte_mbuf *m,
 }
 
 static int
-dpg_ipv6_input(struct dpg_port *port, struct rte_mbuf *m)
+dpg_ipv6_input(struct dpg_task *task, struct rte_mbuf *m)
 {
 	int rc, hl, len, proto;
 	uint8_t *ptr;
@@ -1984,6 +2318,9 @@ dpg_ipv6_input(struct dpg_port *port, struct rte_mbuf *m)
 	struct dpg_icmpv6_hdr *ich6;
 	struct dpg_srv6_hdr *srh;
 	struct dpg_icmpv6_neigh_solicitaion *ns;
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->port_id);
 
 	eh = rte_pktmbuf_mtod(m, struct dpg_eth_hdr *);
 	ih6 = (struct dpg_ipv6_hdr *)(eh + 1);
@@ -2034,7 +2371,7 @@ dpg_ipv6_input(struct dpg_port *port, struct rte_mbuf *m)
 				inet_ntop(AF_INET6, ns->target, tgtbuf, sizeof(tgtbuf));
 				snprintf(desc, sizeof(desc), "Neighbour Solicitation (target=%s)",
 						tgtbuf);
-				dpg_log_ipv6(port, DPG_RX, eh, ih6, desc);
+				dpg_log_ipv6(task, DPG_RX, eh, ih6, desc);
 			}
 
 			target = dpg_ipv6_to_uint128(ns->target);
@@ -2045,12 +2382,12 @@ dpg_ipv6_input(struct dpg_port *port, struct rte_mbuf *m)
 
 			dpg_create_neighbour_advertisment(port, m, ih6, ns);
 
-			dpg_log_ipv6(port, DPG_TX, NULL, ih6, "Neighbour Advertisment");
+			dpg_log_ipv6(task, DPG_TX, NULL, ih6, "Neighbour Advertisment");
 
 			return 0;
 
 		case IPPROTO_IPIP:
-			rc = dpg_ip_input(port, eh, ih6, ptr, len);
+			rc = dpg_ip_input(task, eh, ih6, ptr, len);
 			if (rc == -EINVAL) {
 				goto out;
 			}
@@ -2064,20 +2401,23 @@ dpg_ipv6_input(struct dpg_port *port, struct rte_mbuf *m)
 out:
 	if (port->verbose[DPG_RX]) {
 		snprintf(desc, sizeof(desc), "proto %d", proto);
-		dpg_log_ipv6(port, DPG_RX, eh, ih6, desc);
+		dpg_log_ipv6(task, DPG_RX, eh, ih6, desc);
 	}
 	return -EINVAL;
 
 malformed:
-	dpg_log_custom(port, eh, "Malformed IPv6");
+	dpg_log_custom(task, eh, "Malformed IPv6");
 	return -EINVAL;
 }
 
 static int
-dpg_arp_input(struct dpg_port *port, struct rte_mbuf *m)
+dpg_arp_input(struct dpg_task *task, struct rte_mbuf *m)
 {
 	struct dpg_eth_hdr *eh;
 	struct dpg_arp_hdr *ah;
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->port_id);
 
 	eh = rte_pktmbuf_mtod(m, struct dpg_eth_hdr *);
 	if (m->pkt_len < sizeof(*eh) + sizeof(*ah)) {
@@ -2086,7 +2426,7 @@ dpg_arp_input(struct dpg_port *port, struct rte_mbuf *m)
 
 	ah = (struct dpg_arp_hdr *)(eh + 1);
 
-	dpg_log_arp(port, DPG_RX, eh, ah);
+	dpg_log_arp(task, DPG_RX, eh, ah);
 
 	if (ah->arp_opcode != RTE_BE16(DPG_ARP_OP_REQUEST)) {
 		return -EINVAL;
@@ -2097,7 +2437,7 @@ dpg_arp_input(struct dpg_port *port, struct rte_mbuf *m)
 	ah->arp_sha = port->src_eth_addr;
 	DPG_SWAP(ah->arp_tip, ah->arp_sip);
 
-	dpg_log_arp(port, DPG_TX, NULL, ah);
+	dpg_log_arp(task, DPG_TX, NULL, ah);
 
 	return 0;
 }
@@ -2157,9 +2497,9 @@ dpg_do_task(struct dpg_task *task)
 
 		switch (eh->eth_type) {
 		case RTE_BE16(DPG_ETH_TYPE_IPV4):
-			rc = dpg_ip_input(port, eh, NULL, eh + 1, m->pkt_len - sizeof(*eh));
+			rc = dpg_ip_input(task, eh, NULL, eh + 1, m->pkt_len - sizeof(*eh));
 			if (rc == -EINVAL) {
-				dpg_log_custom(port, eh, "IP");
+				dpg_log_custom(task, eh, "IP");
 			}
 			if (rc < 0) {
 				goto drop;
@@ -2167,14 +2507,14 @@ dpg_do_task(struct dpg_task *task)
 			break;
 
 		case RTE_BE16(DPG_ETH_TYPE_IPV6):
-			rc = dpg_ipv6_input(port, m);
+			rc = dpg_ipv6_input(task, m);
 			if (rc < 0) {
 				goto drop;
 			}
 			break;
 		
 		case RTE_BE16(DPG_ETH_TYPE_ARP):
-			rc = dpg_arp_input(port, m);
+			rc = dpg_arp_input(task, m);
 			if (rc < 0) {
 				goto drop;
 			}
@@ -2184,7 +2524,7 @@ dpg_do_task(struct dpg_task *task)
 			if (port->verbose[DPG_RX]) {
 				snprintf(proto, sizeof(proto), "proto 0x%04hx",
 						rte_be_to_cpu_16(eh->eth_type));
-				dpg_log_custom(port, eh, proto);
+				dpg_log_custom(task, eh, proto);
 			}
 			goto drop;
 		}
@@ -2210,7 +2550,7 @@ drop:
 		}
 
 		for (i = 0; i < n_reqs; ++i) {
-			m = dpg_create_icmp_request(task);
+			m = dpg_create_request(task);
 			dpg_add_tx(task, m);
 		}
 	}
@@ -2292,10 +2632,11 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 
 	if (rps != port->rps_cur) {
 		rte_eth_dev_get_name_by_port(port->id, port_name);
-		dpg_norm(rps_prev_buf, port->rps_cur, 1);
-		dpg_norm(rps_buf, rps, 1);
-		dpg_norm(rps_lo_buf, port->rps_lo, 1);
-		dpg_norm(rps_step_buf, port->rps_step, 1);
+
+		dpg_print_human_readable(rps_prev_buf, sizeof(rps_prev_buf), port->rps_cur, 1);
+		dpg_print_human_readable(rps_buf, sizeof(rps_buf), rps, 1);
+		dpg_print_human_readable(rps_lo_buf, sizeof(rps_lo_buf), port->rps_lo, 1);
+		dpg_print_human_readable(rps_step_buf, sizeof(rps_step_buf), port->rps_step, 1);
 
 		printf("%s: RPS: %s->%s (lo=%s, step=%s)\n",
 				port_name, rps_prev_buf, rps_buf, rps_lo_buf, rps_step_buf);
@@ -2406,10 +2747,11 @@ dpg_print_report(double d_tsc)
 		}
 		printf("\n");
 	}
-	dpg_norm(ipps_b, ipps, 1);
-	dpg_norm(ibps_b, ibps, 1);
-	dpg_norm(opps_b, opps, 1);
-	dpg_norm(obps_b, obps, 1);
+
+	dpg_print_human_readable(ipps_b, sizeof(ipps_b), ipps, 1);
+	dpg_print_human_readable(ibps_b, sizeof(ibps_b), ibps, 1);
+	dpg_print_human_readable(opps_b, sizeof(opps_b), opps, 1);
+	dpg_print_human_readable(obps_b, sizeof(obps_b), obps, 1);
 
 	printf("%-12s", ipps_b);
 	if (g_dpg_bflag) {
@@ -2575,6 +2917,7 @@ main(int argc, char **argv)
 			port->conf.rxmode.mq_mode = DPG_ETH_MQ_RX_RSS;
 			port->conf.rx_adv_conf.rss_conf.rss_hf =
 					DPG_ETH_RSS_IP | DPG_ETH_RSS_TCP | DPG_ETH_RSS_UDP;
+
 			port->conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
 		}
 
