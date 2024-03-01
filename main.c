@@ -6,6 +6,7 @@
 #include <getopt.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -1069,14 +1070,32 @@ dpg_eth_macaddr_get(uint16_t port_id, dpg_eth_addr_t *mac_addr)
 	int rc;
 
 #if RTE_VERSION <= RTE_VERSION_NUM(19, 8, 0, 99)
-	rc = rte_eth_macaddr_get(port_id, mac_addr);
-#else
-	// 19.11.0.99
 	rte_eth_macaddr_get(port_id, mac_addr);
 	rc = 0;
+#else
+	// 19.11.0.99
+	rc = rte_eth_macaddr_get(port_id, mac_addr);
 #endif
-
 	return rc;
+}
+
+static void
+dpg_eth_dev_info_get(uint16_t port_id, struct rte_eth_dev_info *dev_info)
+{
+#if RTE_VERSION <= RTE_VERSION_NUM(19, 8, 0, 99)
+	rte_eth_dev_info_get(port_id, dev_info);
+#else
+	// 19.11.0.99
+	int rc;
+	char port_name[RTE_ETH_NAME_MAX_LEN];
+
+	rc = rte_eth_dev_info_get(port_id, dev_info);
+	if (rc < 0) {
+		rte_eth_dev_get_name_by_port(port_id, port_name);
+		dpg_die("rte_eth_dev_info_get('%s') failed (%d:%s)\n",
+				port_name, -rc, rte_strerror(-rc));
+	}
+#endif
 }
 
 static void
@@ -2903,11 +2922,7 @@ main(int argc, char **argv)
 
 		rte_eth_dev_get_name_by_port(port_id, port_name);
 
-		rc = rte_eth_dev_info_get(port_id, &dev_info);
-		if (rc < 0) {
-			dpg_die("rte_eth_dev_info_get('%s') failed (%d:%s)\n",
-					port_name, -rc, rte_strerror(-rc));
-		}
+		dpg_eth_dev_info_get(port_id, &dev_info);
 
 		port->conf = port_conf;
 		if (dev_info.tx_offload_capa & DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
@@ -2965,11 +2980,7 @@ main(int argc, char **argv)
 
 		rte_eth_dev_get_name_by_port(port_id, port_name);
 
-		rc = rte_eth_dev_info_get(port_id, &dev_info);
-		if (rc < 0) {
-			dpg_die("rte_eth_dev_info_get('%s') failed (%d:%s)\n",
-					port_name, -rc, rte_strerror(-rc));
-		}
+		dpg_eth_dev_info_get(port_id, &dev_info);
 
 		for (i = 0; i < port->n_queues; ++i) {
 			rxq_conf = dev_info.default_rxconf;
