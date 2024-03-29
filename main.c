@@ -121,6 +121,13 @@ typedef struct rte_ether_addr dpg_eth_addr_t;
 #define dpg_dev_name(dev) rte_dev_name(dev)
 #endif
 
+#define DPG_TCP_FIN 0x01
+#define DPG_TCP_SYN 0x02
+#define DPG_TCP_RST 0x04
+#define DPG_TCP_PSH 0x08
+#define DPG_TCP_ACK 0x10
+#define DPG_TCP_URG 0x20
+
 typedef unsigned __int128 dpg_uint128_t;
 
 struct dpg_dlist {
@@ -227,6 +234,18 @@ struct dpg_udp_hdr {
 	rte_be16_t dst_port;
 	rte_be16_t dgram_len;
 	rte_be16_t dgram_cksum;
+} DPG_PACKED;
+
+struct dpg_tcp_hdr {
+	rte_be16_t src_port;
+	rte_be16_t dst_port;
+	rte_be32_t sent_seq;
+	rte_be32_t recv_ack;
+	uint8_t data_off;
+	uint8_t tcp_flags;
+	rte_be16_t rx_win;
+	rte_be16_t cksum;
+	rte_be16_t tcp_urp;
 } DPG_PACKED;
 
 struct dpg_ipv4_pseudo_hdr {
@@ -656,6 +675,12 @@ dpg_strbuf_add(struct dpg_strbuf *sb, const void *buf, int size)
 }
 
 static void
+dpg_strbuf_addch(struct dpg_strbuf *sb, char c)
+{
+	dpg_strbuf_add(sb, &c, 1);
+}
+
+static void
 dpg_strbuf_adds(struct dpg_strbuf *sb, const char *str)
 {
 	dpg_strbuf_add(sb, str, strlen(str));
@@ -680,6 +705,30 @@ dpg_strbuf_addf(struct dpg_strbuf *sb, const char *fmt, ...)
 	dpg_strbuf_vaddf(sb, fmt, ap);
 	va_end(ap);
 }
+
+static void
+dpg_strbuf_add_tcp_flags(struct dpg_strbuf *sb, uint8_t tcp_flags)
+{
+	if (tcp_flags & DPG_TCP_FIN) {
+		dpg_strbuf_addch(sb, 'F');
+	}
+	if (tcp_flags & DPG_TCP_SYN) {
+		dpg_strbuf_addch(sb, 'S');
+	}
+	if (tcp_flags & DPG_TCP_RST) {
+		dpg_strbuf_addch(sb, 'R');
+	}
+	if (tcp_flags & DPG_TCP_PSH) {
+		dpg_strbuf_addch(sb, 'P');
+	}
+	if (tcp_flags & DPG_TCP_ACK) {
+		dpg_strbuf_addch(sb, '.');
+	}
+	if (tcp_flags & DPG_TCP_URG) {
+		dpg_strbuf_addch(sb, 'U');
+	}
+}
+
 
 static void
 dpg_darray_init(struct dpg_darray *da, int item_size)
@@ -1321,6 +1370,7 @@ dpg_log_packet(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dp
 	struct dpg_strbuf sb;
 	struct dpg_port *port;
 	struct dpg_icmp_hdr *ich;
+	struct dpg_tcp_hdr *th;
 	struct dpg_udp_hdr *uh;
 
 	port = dpg_port_get(task->port_id);
@@ -1335,7 +1385,7 @@ dpg_log_packet(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dp
 	if (ih6 != NULL) {
 		inet_ntop(AF_INET6, &ih6->src_addr, sabuf, sizeof(sabuf));
 		inet_ntop(AF_INET6, &ih6->dst_addr, dabuf, sizeof(dabuf));
-		dpg_strbuf_addf(&sb, "%s->%s\n\t", sabuf, dabuf);
+		dpg_strbuf_addf(&sb, "%s->%s: ", sabuf, dabuf);
 	}
 
 	inet_ntop(AF_INET, &ih->src_addr, sabuf, sizeof(sabuf));
@@ -1349,6 +1399,15 @@ dpg_log_packet(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dp
 				sabuf, dabuf,
 				rte_be_to_cpu_16(ich->icmp_ident),
 				rte_be_to_cpu_16(ich->icmp_seq_nb));
+		break;
+
+	case IPPROTO_TCP:
+		th = l4_hdr;
+		dpg_strbuf_adds(&sb, "TCP [");
+		dpg_strbuf_add_tcp_flags(&sb, th->tcp_flags);
+		dpg_strbuf_addf(&sb, "] %s:%hu->%s:%hu",
+				sabuf, rte_be_to_cpu_16(th->src_port),
+				dabuf, rte_be_to_cpu_16(th->dst_port));
 		break;
 
 	case IPPROTO_UDP:
@@ -1726,6 +1785,7 @@ dpg_parse_port(int argc, char **argv)
 		{ "rx-verbose", required_argument, 0, 0 },
 		{ "tx-verbose", required_argument, 0, 0 },
 		{ "udp", no_argument, 0, 0 },
+		{ "tcp", no_argument, 0, 0 },
 		{ "icmp", no_argument, 0, 0 },
 		{ "icmp-id", required_argument, 0, 0 },
 		{ "icmp-seq", required_argument, 0, 0 },
@@ -1754,6 +1814,8 @@ dpg_parse_port(int argc, char **argv)
 				port->verbose[DPG_TX] = strtoul(optarg, NULL, 10);
 			} else if (!strcmp(optname, "udp")) {
 				port->proto = IPPROTO_UDP;
+			} else if (!strcmp(optname, "tcp")) {
+				port->proto = IPPROTO_TCP;
 			} else if (!strcmp(optname, "icmp")) {
 				port->proto = IPPROTO_ICMP;
 			} else if (!strcmp(optname, "icmp-id")) {
@@ -2018,8 +2080,8 @@ dpg_next_session(struct dpg_task *task)
 
 	port = dpg_port_get(task->port_id);
 	if (port->rand) {
-		r = dpg_rand_xorshift(&task->rand_state);
 		DPG_DLIST_FOREACH(it, &task->session_field_head, list) {
+			r = dpg_rand_xorshift(&task->rand_state);
 			dpg_iterator_set_rand(it, r);
 		}
 
@@ -2050,6 +2112,7 @@ dpg_create_request(struct dpg_task *task)
 	struct dpg_ipv4_hdr *ih;
 	struct dpg_ipv6_hdr *ih6;
 	struct dpg_icmp_hdr *ich;
+	struct dpg_tcp_hdr *th;
 	struct dpg_udp_hdr *uh;
 	struct dpg_srv6_hdr *srh;
 	struct dpg_port *port;
@@ -2068,6 +2131,10 @@ dpg_create_request(struct dpg_task *task)
 	switch (port->proto) {
 	case IPPROTO_ICMP:
 		m->pkt_len += sizeof(*ich);
+		break;
+
+	case IPPROTO_TCP:
+		m->pkt_len += sizeof(*th);
 		break;
 
 	default:
@@ -2158,6 +2225,27 @@ dpg_create_request(struct dpg_task *task)
 		ich->icmp_cksum = dpg_cksum(ich, ih_total_length - sizeof(*ih));
 		break;
 
+	case IPPROTO_TCP:
+		th = (struct dpg_tcp_hdr *)(ih + 1);
+
+		field = task->session_field + DPG_SESSION_SRC_PORT;
+		src_port = dpg_iterator_get(field);
+		th->src_port = rte_cpu_to_be_16(src_port);
+
+		field = task->session_field + DPG_SESSION_DST_PORT;
+		dst_port = dpg_iterator_get(field);
+		th->dst_port = rte_cpu_to_be_16(dst_port);
+
+		th->sent_seq = rte_cpu_to_be_32(1);
+		th->recv_ack = 0;
+		th->data_off = sizeof(*th) << 2;
+		th->tcp_flags = DPG_TCP_SYN;
+		th->rx_win = rte_cpu_to_be_16(4096);
+		th->cksum = 0;
+		th->tcp_urp = 0;
+		th->cksum = dpg_ipv4_udp_cksum(ih, th, ih_total_length - sizeof(*ih));
+		break;
+
 	default:
 		// UDP
 		uh = (struct dpg_udp_hdr *)(ih + 1);
@@ -2189,10 +2277,12 @@ dpg_ip_input(struct dpg_task *task, struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr 
 		void *ptr, int len)
 {
 	int hl, ih_total_length;
+	uint32_t seq;
 	void *l4_hdr;
 	struct dpg_ipv4_hdr *ih;
 	struct dpg_icmp_hdr *ich;
 	struct dpg_udp_hdr *uh;
+	struct dpg_tcp_hdr *th;
 	struct dpg_port *port;
 
 	port = dpg_port_get(task->port_id);
@@ -2242,6 +2332,22 @@ dpg_ip_input(struct dpg_task *task, struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr 
 
 		ich->icmp_cksum = 0;
 		ich->icmp_cksum = dpg_cksum(ich, ih_total_length - hl);
+		break;
+
+	case IPPROTO_TCP:
+		if (ih_total_length < hl + sizeof(*th)) {
+			return -EINVAL;
+		}
+
+		th = (struct dpg_tcp_hdr *)l4_hdr;
+
+		DPG_SWAP(th->src_port, th->dst_port);
+		th->tcp_flags = DPG_TCP_SYN|DPG_TCP_ACK;
+		seq = rte_be_to_cpu_32(th->sent_seq);
+		th->sent_seq = rte_cpu_to_be_32(1);
+		th->recv_ack = rte_cpu_to_be_32(seq + 1);
+		th->cksum = 0;
+		th->cksum = dpg_ipv4_udp_cksum(ih, th, ih_total_length - hl);
 		break;
 
 	case IPPROTO_UDP:
