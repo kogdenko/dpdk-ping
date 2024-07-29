@@ -329,6 +329,12 @@ enum dpg_session_field {
 	DPG_SESSION_FIELD_MAX,
 };
 
+struct dpg_tx_queue {
+	int bytes;
+	int n_pkts;
+	struct rte_mbuf *pkts[DPG_TXBUF_SIZE];
+};
+
 struct dpg_task {
 	struct dpg_dlist llist;
 	struct dpg_dlist plist;
@@ -349,9 +355,8 @@ struct dpg_task {
 
 	struct dpg_dlist session_field_head;
 
-	int tx_bytes;
-	int n_tx_pkts;
-	struct rte_mbuf *tx_pkts[DPG_TXBUF_SIZE];
+	struct dpg_tx_queue req_queue;
+	struct dpg_tx_queue rpl_queue;
 };
 
 struct dpg_port {
@@ -402,10 +407,10 @@ struct dpg_port {
 
 	struct dpg_dlist session_field_head;
 
-	bool no_drop;
-	double no_drop_percent;
-	u_int no_drop_tries;
-	u_int no_drop_seq;
+	bool pdr;
+	double pdr_percent;
+	u_int pdr_tries;
+	u_int pdr_seq;
 
 	uint16_t n_rxd;
 	uint16_t n_txd;
@@ -1556,6 +1561,45 @@ dpg_container_parse_ipv6(char *str, struct dpg_container *c)
 	return rc;
 }
 
+static bool
+dpg_tx_queue_full(struct dpg_tx_queue *q)
+{
+	return q->n_pkts == DPG_ARRAY_SIZE(q->pkts);
+}
+
+static bool
+dpg_tx_queue_empty(struct dpg_tx_queue *q)
+{
+	return q->n_pkts == 0;
+}
+
+static int
+dpg_tx_queue_room(struct dpg_tx_queue *q)
+{
+	return DPG_ARRAY_SIZE(q->pkts) - q->n_pkts;
+}
+
+static void
+dpg_tx_queue_add(struct dpg_tx_queue *q, struct rte_mbuf *m)
+{
+	assert(!dpg_tx_queue_full(q));
+	q->pkts[q->n_pkts++] = m;
+}
+
+static int
+dpg_tx_queue_tx(struct dpg_tx_queue *q, int port_id, int queue_id)
+{
+	int txed;
+
+	txed = 0;
+	if (q->n_pkts) {
+		txed = rte_eth_tx_burst(port_id, queue_id, q->pkts, q->n_pkts);
+		memmove(q->pkts, q->pkts + txed, (q->n_pkts - txed) * sizeof (struct rte_mbuf *));
+		q->n_pkts -= txed;
+	}
+	return txed;
+}
+
 static void
 dpg_del_session_field(struct dpg_port *port, int field_id)
 {
@@ -1592,10 +1636,10 @@ dpg_create_port(void)
 	port->pkt_len = DPG_DEFAULT_PKT_LEN;
 	port->proto = IPPROTO_ICMP;
 
-	port->no_drop = DPG_DEFAULT_NO_DROP;
-	port->no_drop_percent = DPG_DEFAULT_NO_DROP_PERCENT;
-	port->no_drop_tries = DPG_DEFAULT_NO_DROP_TRIES;
-	port->no_drop_seq = DPG_DEFAULT_NO_DROP_SEQ;
+	port->pdr = DPG_DEFAULT_NO_DROP;
+	port->pdr_percent = DPG_DEFAULT_NO_DROP_PERCENT;
+	port->pdr_tries = DPG_DEFAULT_NO_DROP_TRIES;
+	port->pdr_seq = DPG_DEFAULT_NO_DROP_SEQ;
 
 	dpg_dlist_init(&port->task_head);
 	dpg_dlist_init(&port->session_field_head);
@@ -1742,7 +1786,7 @@ dpg_print_usage(void)
 	"\t--srv6-src {IPv6}:  SRv6 tunnel source address\n"
 	"\t--srv6-dst {IPv6..}:  SRv6 tunnel destination address iterator\n"
 	"\t--software-counters {bool}:  Use software counters for reports (default: %s)\n"
-	"\t--no-drop {%%[,T[,t]]}:  Specify no-drop rate search algorithm parameters (default: %f,%u,%u)\n"
+	"\t--pdr {%%[,T[,t]]}:  Specify partial drop rate rate parameters (default: %f,%u,%u)\n"
 	"\tIterator of values x (x..):  {x,x,x...|x-x}\n"
 	"Ports:\n",
 		dpg_bool_str(g_dpg_bflag),
@@ -1803,7 +1847,7 @@ dpg_parse_port(int argc, char **argv)
 		{ "srv6-src", required_argument, 0, 0 },
 		{ "srv6-dst", required_argument, 0, 0 },
 		{ "software-counters", required_argument, 0, 0 },
-		{ "no-drop",  required_argument, 0, 0 },
+		{ "pdr",  required_argument, 0, 0 },
 		{ "rand", no_argument, 0, 0 },
 		{ "rand-seed", required_argument, 0, 0 },
 		{ "rand-sessions", required_argument, 0, 0 },
@@ -1862,27 +1906,26 @@ dpg_parse_port(int argc, char **argv)
 				if (rc < 0) {
 					dpg_invalid_argument(0, optname);
 				}
-			} else if (!strcmp(optname, "no-drop")) {
+			} else if (!strcmp(optname, "pdr")) {
 				rc = sscanf(optarg, "%lf,%u,%u",
-						&port->no_drop_percent,
-						&port->no_drop_tries,
-						&port->no_drop_seq);
+						&port->pdr_percent,
+						&port->pdr_tries,
+						&port->pdr_seq);
 				if (rc == 0 || rc == EOF) {
 					dpg_invalid_argument(0, optname);
 				} else if (rc == 2) {
-					port->no_drop_seq = DPG_MAX(1, port->no_drop_tries / 3);
+					port->pdr_seq = DPG_MAX(1, port->pdr_tries / 3);
 				}
 
-				if (port->no_drop_percent <= 0 || port->no_drop_percent >= 100) {
+				if (port->pdr_percent <= 0 || port->pdr_percent >= 100) {
 					dpg_invalid_argument(0, optname);
 				}
 
-				if (port->no_drop_tries < 2 ||
-				    port->no_drop_tries < port->no_drop_seq) {
+				if (port->pdr_tries < 2 || port->pdr_tries < port->pdr_seq) {
 					dpg_invalid_argument(0, optname);
 				}
 
-				port->no_drop = true;
+				port->pdr = true;
 			} else if (!strcmp(optname, "rand")) {
 				dpg_set_rand(port);
 			} else if (!strcmp(optname, "rand-seed")) {
@@ -2589,13 +2632,6 @@ dpg_arp_input(struct dpg_task *task, struct rte_mbuf *m)
 	return 0;
 }
 
-static void
-dpg_add_tx(struct dpg_task *task, struct rte_mbuf *m)
-{
-	task->tx_bytes += m->pkt_len;
-	task->tx_pkts[task->n_tx_pkts++] = m;
-}
-
 static int
 dpg_rps_ratelimit(struct dpg_task *task, int rate)
 {
@@ -2606,7 +2642,9 @@ dpg_rps_ratelimit(struct dpg_task *task, int rate)
 		return 0;
 	}
 
-	room = DPG_TXBUF_SIZE - task->n_tx_pkts;
+	room = 0;
+	room += dpg_tx_queue_room(&task->req_queue);
+	room += dpg_tx_queue_room(&task->rpl_queue);
 
 	tsc = dpg_rdtsc();
 	dt = tsc - task->req_tx_time;
@@ -2623,7 +2661,7 @@ dpg_rps_ratelimit(struct dpg_task *task, int rate)
 static void
 dpg_do_task(struct dpg_task *task)
 {
-	int i, rc, n_rx, n_reqs, room, txed, rx_bytes, tx_bytes;
+	int i, rc, n_rx, n_reqs, room, txed, rx_bytes;
 	char proto[32];
 	struct dpg_eth_hdr *eh;
 	struct dpg_port *port;
@@ -2678,15 +2716,15 @@ dpg_do_task(struct dpg_task *task)
 
 		dpg_set_eth_hdr_addresses(port, m);
 
-		if (task->n_tx_pkts < DPG_TXBUF_SIZE) {
-			dpg_add_tx(task, m);
+		if (!dpg_tx_queue_full(&task->rpl_queue)) {
+			dpg_tx_queue_add(&task->rpl_queue, m);
 			continue;
 		}
 drop:
 		rte_pktmbuf_free(m);
 	}
 
-	room = DPG_TXBUF_SIZE - task->n_tx_pkts;
+	room = dpg_tx_queue_room(&task->req_queue);
 	if (port->Rflag && room) {
 		if (task->rps == 0) {
 			n_reqs = 0;
@@ -2696,36 +2734,27 @@ drop:
 			n_reqs = room;
 		}
 
+		n_reqs = DPG_MIN(n_reqs, room);
+
 		for (i = 0; i < n_reqs; ++i) {
 			m = dpg_create_request(task);
-			dpg_add_tx(task, m);
+			dpg_tx_queue_add(&task->req_queue, m);
 		}
 	}
 
-	if (task->n_tx_pkts) {
-		txed = rte_eth_tx_burst(task->port_id, task->queue_id, task->tx_pkts, task->n_tx_pkts);
-		memmove(task->tx_pkts, task->tx_pkts + txed,
-				(task->n_tx_pkts - txed) * sizeof (struct rte_mbuf *));
-		task->n_tx_pkts -= txed;
-	} else {
-		txed = 0;
+	txed = dpg_tx_queue_tx(&task->rpl_queue, task->port_id, task->queue_id);
+	if (dpg_tx_queue_empty(&task->rpl_queue)) {
+		txed += dpg_tx_queue_tx(&task->req_queue, task->port_id, task->queue_id);
 	}
 
 	if (port->software_counters) {
-		tx_bytes = task->tx_bytes;
-		task->tx_bytes = 0;
-
-		for (i = 0; i < task->n_tx_pkts; ++i) {
-			task->tx_bytes += task->tx_pkts[i]->pkt_len;
-		}
-
 		port = dpg_port_get(task->port_id);
 
 		dpg_counter_add(&port->ipackets, n_rx);
 		dpg_counter_add(&port->ibytes, rx_bytes);
 
 		dpg_counter_add(&port->opackets, txed);
-		dpg_counter_add(&port->obytes, tx_bytes - task->tx_bytes);
+		dpg_counter_add(&port->obytes, 0);
 	}
 }
 
@@ -2736,7 +2765,7 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 	char rps_buf[32], rps_prev_buf[32], rps_lo_buf[32], rps_step_buf[32];
 
-	if (port->rps_max <= DPG_NO_DROP_RPS_MIN || !port->no_drop) {
+	if (port->rps_max <= DPG_NO_DROP_RPS_MIN || !port->pdr) {
 		return port->rps_max;
 	}
 
@@ -2746,7 +2775,7 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 
 	port->rps_tries++;
 
-	if (ipps + 1 >= opps ||  (opps - ipps) < port->no_drop_percent * opps / 100) {
+	if (ipps + 1 >= opps ||  (opps - ipps) < port->pdr_percent * opps / 100) {
 		port->rps_seq++;
 	} else {
 		port->rps_seq = 0;
@@ -2754,7 +2783,7 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 
 	rps = port->rps_cur;
 	
-	if (port->rps_seq == port->no_drop_seq) {
+	if (port->rps_seq == port->pdr_seq) {
 		port->rps_seq = port->rps_tries = 0;
 
 		port->rps_lo = port->rps_cur;
@@ -2764,7 +2793,7 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 			port->rps_step *= 2;
 			rps = port->rps_lo + port->rps_step;
 		}
-	} else if (port->rps_tries == port->no_drop_tries) {
+	} else if (port->rps_tries == port->pdr_tries) {
 		port->rps_seq = port->rps_tries = 0;
 
 		if (port->rps_step == 0) {
