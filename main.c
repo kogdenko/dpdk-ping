@@ -1787,6 +1787,9 @@ dpg_print_usage(void)
 	"\t--srv6-dst {IPv6..}:  SRv6 tunnel destination address iterator\n"
 	"\t--software-counters {bool}:  Use software counters for reports (default: %s)\n"
 	"\t--pdr {%%[,T[,t]]}:  Specify partial drop rate rate parameters (default: %f,%u,%u)\n"
+	"\t--rand:  Iterate sessions randomly\n"
+	"\t--rand-seed {number}:  Specify random generator seed\n"
+	"\t--rand-sessions {number}: Specify _approximate_ random sessions number\n"
 	"\tIterator of values x (x..):  {x,x,x...|x-x}\n"
 	"Ports:\n",
 		dpg_bool_str(g_dpg_bflag),
