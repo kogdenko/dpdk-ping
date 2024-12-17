@@ -843,15 +843,6 @@ dpg_container_array_find(struct dpg_container *ct, dpg_uint128_t val)
 	return rc >= 0;
 }
 
-static void
-dpg_container_array_init(struct dpg_container *ct)
-{
-	dpg_darray_init(&ct->array, sizeof(dpg_uint128_t));
-
-	ct->get = dpg_container_array_get;
-	ct->find = dpg_container_array_find;
-}
-
 static dpg_uint128_t
 dpg_container_interval_get(struct dpg_container *ct, dpg_uint128_t i)
 {
@@ -865,24 +856,22 @@ dpg_container_interval_find(struct dpg_container *ct, dpg_uint128_t val)
 	return val >= ct->begin && val <= ct->end;
 }
 
-static void
-dpg_container_interval_init(struct dpg_container *ct)
-{
-	ct->get = dpg_container_interval_get;
-	ct->find = dpg_container_interval_find;
-}
-
 static dpg_uint128_t
 dpg_container_get(struct dpg_container *ct, dpg_uint128_t i)
 {
 	assert(ct->size);
+	assert(ct->get != NULL);
 	return (*ct->get)(ct, i);
 }
 
 static bool
 dpg_container_find(struct dpg_container *ct, dpg_uint128_t val)
 {
-	return (*ct->find)(ct, val);
+	if (ct->find == NULL) {
+		return -ESRCH;
+	} else {
+		return (*ct->find)(ct, val);
+	}
 }
 
 static void
@@ -903,7 +892,10 @@ dpg_container_parse(char *str, struct dpg_container *ct, int (*parse)(char *, dp
 
 	d = strchr(str, '-');
 	if (d == NULL) {
-		dpg_container_array_init(ct);
+		dpg_darray_init(&ct->array, sizeof(dpg_uint128_t));
+
+		ct->get = dpg_container_array_get;
+		ct->find = dpg_container_array_find;
 
 		for (s = strtok(str, ","); s != NULL; s = strtok(NULL, ",")) {
 			val = dpg_darray_add(&ct->array);
@@ -917,7 +909,8 @@ dpg_container_parse(char *str, struct dpg_container *ct, int (*parse)(char *, dp
 	} else {
 		*d = '\0';
 
-		dpg_container_interval_init(ct);
+		ct->get = dpg_container_interval_get;
+		ct->find = dpg_container_interval_find;
 
 		rc = (*parse)(str, &ct->begin);
 		if (rc < 0) {
