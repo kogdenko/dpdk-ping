@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
+// Author: Konstantin Kogdenko
 
 #include <arpa/inet.h>
 #include <assert.h>
