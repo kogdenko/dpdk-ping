@@ -38,17 +38,17 @@
 #define DPG_DEFAULT_ICMP_ID "1"
 #define DPG_DEFAULT_ICMP_SEQ "1"
 #define DPG_DEFAULT_PKT_LEN 60
-#define DPG_DEFAULT_NO_DROP false
-#define DPG_DEFAULT_NO_DROP_PERCENT 0.2
-#define DPG_DEFAULT_NO_DROP_TRIES 30
-#define DPG_DEFAULT_NO_DROP_SEQ 10
+#define DPG_DEFAULT_PDR false
+#define DPG_DEFAULT_PDR_PERCENT 0.2
+#define DPG_DEFAULT_PDR_TRIES 30
+#define DPG_DEFAULT_PDR_SEQ 10
 
-#define DPG_UDP_DATA_PING "ping"
-#define DPG_UDP_DATA_PONG "pong"
+#define DPG_PAYLOAD_PING 0x70696e67 //ping
+#define DPG_PAYLOAD_PONG 0x706f6e67 //pong"
 
 #define DPG_LOG_BUFSIZE 512
 
-#define DPG_NO_DROP_RPS_MIN 5
+#define DPG_PDR_RPS_MIN 5
 
 #define DPG_ETH_ADDRSTRLEN 18
 
@@ -123,6 +123,8 @@ typedef struct rte_ether_addr dpg_eth_addr_t;
 
 #define dpg_ntoh16 rte_be_to_cpu_16
 #define dpg_hton16 rte_cpu_to_be_16
+#define dpg_ntoh32 rte_be_to_cpu_32
+#define dpg_hton32 rte_cpu_to_be_32
 
 #define DPG_TCP_FIN 0x01
 #define DPG_TCP_SYN 0x02
@@ -181,9 +183,6 @@ struct dpg_iterator {
 	dpg_uint128_t step;
 
 	struct dpg_container *container;
-
-//	uint32_t upper_size;
-//	uint32_t upper_mask;
 };
 
 struct dpg_eth_hdr {
@@ -318,6 +317,11 @@ struct dpg_srv6_hdr {
 	uint8_t localsid[DPG_IPV6_ADDR_SIZE];
 } DPG_PACKED;
 
+struct dpg_payload {
+	rte_be32_t dir;
+	rte_be32_t seq;
+};
+
 enum dpg_session_field {
 	DPG_SESSION_SRC_IP = 0,
 	DPG_SESSION_DST_IP,
@@ -397,6 +401,10 @@ struct dpg_port {
 	struct dpg_counter opackets;
 	struct dpg_counter ibytes;
 	struct dpg_counter obytes;
+
+	uint32_t send_seq;
+	uint32_t recv_seq;
+	uint32_t drops;
 
 	uint64_t ipackets_prev;
 	uint64_t opackets_prev;
@@ -1629,10 +1637,10 @@ dpg_create_port(void)
 	port->pkt_len = DPG_DEFAULT_PKT_LEN;
 	port->proto = IPPROTO_ICMP;
 
-	port->pdr = DPG_DEFAULT_NO_DROP;
-	port->pdr_percent = DPG_DEFAULT_NO_DROP_PERCENT;
-	port->pdr_tries = DPG_DEFAULT_NO_DROP_TRIES;
-	port->pdr_seq = DPG_DEFAULT_NO_DROP_SEQ;
+	port->pdr = DPG_DEFAULT_PDR;
+	port->pdr_percent = DPG_DEFAULT_PDR_PERCENT;
+	port->pdr_tries = DPG_DEFAULT_PDR_TRIES;
+	port->pdr_seq = DPG_DEFAULT_PDR_SEQ;
 
 	dpg_dlist_init(&port->task_head);
 	dpg_dlist_init(&port->session_field_head);
@@ -1774,6 +1782,9 @@ dpg_print_usage(void)
 	"\t-L {bytes}:  Packet size (default: %d)\n"
 	"\t--rx-verbose {level}:  Be verbose on rx path (default: %d)\n"
 	"\t--tx-verbose {level}:  Be verbose on tx path (default: %d)\n"
+	"\t--udp:  Send UDP packets\n"
+	"\t--tcp:  Send TCP SYN packets\n"
+	"\t--icmp:  Send ICMP echo packets\n"
 	"\t--icmp-id {id..}:  ICMP request id iterator (default: %s)\n"
 	"\t--icmp-seq {seq..}:  ICMP request sequence iterator (default: %s)\n"
 	"\t--srv6-src {IPv6}:  SRv6 tunnel source address\n"
@@ -1798,10 +1809,10 @@ dpg_print_usage(void)
 		0,
 		DPG_DEFAULT_ICMP_ID,
 		DPG_DEFAULT_ICMP_SEQ,
-		dpg_bool_str(DPG_DEFAULT_NO_DROP),
-		DPG_DEFAULT_NO_DROP_PERCENT,
-		DPG_DEFAULT_NO_DROP_TRIES,
-		DPG_DEFAULT_NO_DROP_SEQ
+		dpg_bool_str(DPG_DEFAULT_PDR),
+		DPG_DEFAULT_PDR_PERCENT,
+		DPG_DEFAULT_PDR_TRIES,
+		DPG_DEFAULT_PDR_SEQ
 	);
 
 	RTE_ETH_FOREACH_DEV(port_id) {
@@ -2156,6 +2167,16 @@ dpg_next_session(struct dpg_task *task)
 	}
 }
 
+static void
+dpg_set_payload(void *data, rte_be32_t dir, uint32_t seq)
+{
+	struct dpg_payload *p;
+
+	p = data;
+	p->dir = dir;
+	p->seq = dpg_hton32(seq);
+}
+
 static struct rte_mbuf *
 dpg_create_request(struct dpg_task *task)
 {
@@ -2193,9 +2214,11 @@ dpg_create_request(struct dpg_task *task)
 
 	default:
 		// UDP
-		m->pkt_len += sizeof(*uh) + sizeof(DPG_UDP_DATA_PING);
+		m->pkt_len += sizeof(*uh);
 		break;
 	}
+
+	m->pkt_len += sizeof(struct dpg_payload);
 
 	if (port->srv6) {
 		m->pkt_len += sizeof(*ih6) + sizeof(*srh);
@@ -2276,6 +2299,8 @@ dpg_create_request(struct dpg_task *task)
 		icmp_seq = dpg_iterator_get(field);
 		ich->icmp_seq_nb = dpg_hton16(icmp_seq);
 
+		dpg_set_payload(ich + 1, DPG_PAYLOAD_PING, port->send_seq++);
+
 		ich->icmp_cksum = dpg_cksum(ich, ih_total_length - sizeof(*ih));
 		break;
 
@@ -2295,8 +2320,11 @@ dpg_create_request(struct dpg_task *task)
 		th->data_off = sizeof(*th) << 2;
 		th->tcp_flags = DPG_TCP_SYN;
 		th->rx_win = dpg_hton16(4096);
-		th->cksum = 0;
 		th->tcp_urp = 0;
+
+		dpg_set_payload(th + 1, DPG_PAYLOAD_PING, port->send_seq++);
+
+		th->cksum = 0;
 		th->cksum = dpg_ipv4_udp_cksum(ih, th, ih_total_length - sizeof(*ih));
 		break;
 
@@ -2311,10 +2339,11 @@ dpg_create_request(struct dpg_task *task)
 		field = task->session_field + DPG_SESSION_DST_PORT;
 		dst_port = dpg_iterator_get(field);
 		uh->dst_port = dpg_hton16(dst_port);
-
 		uh->dgram_len = dpg_hton16(ih_total_length - sizeof(*ih));
+
+		dpg_set_payload(uh + 1, DPG_PAYLOAD_PING, port->send_seq++);
+
 		uh->dgram_cksum = 0;
-		memcpy(uh + 1, DPG_UDP_DATA_PING, sizeof(DPG_UDP_DATA_PING));
 		uh->dgram_cksum = dpg_ipv4_udp_cksum(ih, uh, ih_total_length - sizeof(*ih));
 		break;
 	}
@@ -2331,12 +2360,15 @@ dpg_ip_input(struct dpg_task *task, struct rte_mbuf *m,
 		struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr *ih6, void *ptr, int len)
 {
 	int hl, ih_total_length;
+	bool echo;
 	uint32_t seq;
+	uint32_t recv_seq;
 	void *l4_hdr;
 	struct dpg_ipv4_hdr *ih;
 	struct dpg_icmp_hdr *ich;
 	struct dpg_udp_hdr *uh;
 	struct dpg_tcp_hdr *th;
+	struct dpg_payload *payload;
 	struct dpg_port *port;
 
 	port = dpg_port_get(task->port_id);
@@ -2363,9 +2395,11 @@ dpg_ip_input(struct dpg_task *task, struct rte_mbuf *m,
 
 	dpg_log_packet(task, DPG_RX, eh, ih6, ih, hl);
 
-	if (!port->Eflag) {
+	echo = port->Eflag;
+	if (!echo && !port->pdr) {
 		return -ENOTSUP;
 	}
+
 	if (ih6 != NULL) {
 		if (port->srv6) {
 			return -ENOTSUP;
@@ -2383,75 +2417,95 @@ dpg_ip_input(struct dpg_task *task, struct rte_mbuf *m,
 
 	switch (ih->next_proto_id) {
 	case IPPROTO_ICMP:
-		if (ih_total_length < hl + sizeof(*ich)) {
+		if (ih_total_length < hl + sizeof(*ich) + sizeof(*payload)) {
 			return -EINVAL;
 		}
 
 		ich = (struct dpg_icmp_hdr *)l4_hdr;
 
-		if (ich->icmp_type != DPG_IP_ICMP_ECHO_REQUEST) {
-			return -ENOTSUP;
+		payload = (struct dpg_payload *)(ich + 1);
+
+		if (echo) {
+			if (ich->icmp_type != DPG_IP_ICMP_ECHO_REQUEST) {
+				return -ENOTSUP;
+			}
+			if (payload->dir != DPG_PAYLOAD_PING) {
+				return -ENOTSUP;
+			}
+			payload->dir = DPG_PAYLOAD_PONG;
+			ich->icmp_type = DPG_IP_ICMP_ECHO_REPLY;
+			ich->icmp_cksum = 0;
+			ich->icmp_cksum = dpg_cksum(ich, ih_total_length - hl);
 		}
-
-		ich->icmp_type = DPG_IP_ICMP_ECHO_REPLY;
-		DPG_SWAP(ih->src_addr, ih->dst_addr);
-
-		ich->icmp_cksum = 0;
-		ich->icmp_cksum = dpg_cksum(ich, ih_total_length - hl);
 		break;
 
 	case IPPROTO_TCP:
-		if (ih_total_length < hl + sizeof(*th)) {
+		if (ih_total_length < hl + sizeof(*th) + sizeof(*payload)) {
 			return -EINVAL;
 		}
 
 		th = (struct dpg_tcp_hdr *)l4_hdr;
 
-		if (th->tcp_flags != DPG_TCP_SYN) {
-			return -ENOTSUP;
-		}
+		payload = (struct dpg_payload *)(th + 1);
 
-		DPG_SWAP(th->src_port, th->dst_port);
-		th->tcp_flags = DPG_TCP_SYN|DPG_TCP_ACK;
-		seq = rte_be_to_cpu_32(th->sent_seq);
-		th->sent_seq = rte_cpu_to_be_32(1);
-		th->recv_ack = rte_cpu_to_be_32(seq + 1);
-		th->cksum = 0;
-		th->cksum = dpg_ipv4_udp_cksum(ih, th, ih_total_length - hl);
+		if (echo) {
+			if (th->tcp_flags != DPG_TCP_SYN) {
+				return -ENOTSUP;
+			}
+			if (payload->dir != DPG_PAYLOAD_PING) {
+				return -ENOTSUP;
+			}
+			payload->dir = DPG_PAYLOAD_PONG;
+			DPG_SWAP(th->src_port, th->dst_port);
+			th->tcp_flags = DPG_TCP_SYN|DPG_TCP_ACK;
+			seq = rte_be_to_cpu_32(th->sent_seq);
+			th->sent_seq = rte_cpu_to_be_32(1);
+			th->recv_ack = rte_cpu_to_be_32(seq + 1);
+			th->cksum = 0;
+			th->cksum = dpg_ipv4_udp_cksum(ih, th, ih_total_length - hl);
+		}
 		break;
 
 	case IPPROTO_UDP:
-		if (ih_total_length < hl + sizeof(*uh)) {
+		if (ih_total_length < hl + sizeof(*uh) + sizeof(*payload)) {
 			return -EINVAL;
 		}
 
-		if (ih_total_length < hl + sizeof(*uh) + sizeof(DPG_UDP_DATA_PING)) {
-			return -ENOTSUP;
-		}
-
 		uh = (struct dpg_udp_hdr *)l4_hdr;
-	
-		if (memcmp(uh + 1, DPG_UDP_DATA_PING, sizeof(DPG_UDP_DATA_PING))) {
-			return -ENOTSUP;
-		}
 
-		DPG_SWAP(uh->src_port, uh->dst_port);
-		memcpy(uh + 1, DPG_UDP_DATA_PONG, sizeof(DPG_UDP_DATA_PONG));
-		uh->dgram_cksum = 0;
-		uh->dgram_cksum = dpg_ipv4_udp_cksum(ih, uh, ih_total_length - hl);
+		payload = (struct dpg_payload *)(uh + 1);
+
+		if (echo) {
+			if (payload->dir != DPG_PAYLOAD_PING) {
+				return -ENOTSUP;
+			}
+			payload->dir = DPG_PAYLOAD_PONG;
+			DPG_SWAP(uh->src_port, uh->dst_port);
+			uh->dgram_cksum = 0;
+			uh->dgram_cksum = dpg_ipv4_udp_cksum(ih, uh, ih_total_length - hl);
+		}
 		break;
 
 	default:
 		return -ENOTSUP;
 	}
 
-	DPG_SWAP(ih->src_addr, ih->dst_addr);
-	ih->hdr_checksum = 0;
-	ih->hdr_checksum = dpg_cksum(ih, hl);
+	if (!echo) {
+		recv_seq = dpg_ntoh32(payload->seq);
+		if (port->recv_seq != recv_seq) {
+			port->drops++;
+		}
+		port->recv_seq = recv_seq + 1;
+		return -ENOTSUP;
+	} else {
+		DPG_SWAP(ih->src_addr, ih->dst_addr);
+		ih->hdr_checksum = 0;
+		ih->hdr_checksum = dpg_cksum(ih, hl);
 
-	dpg_log_packet(task, DPG_TX, eh, ih6, ih, hl);
+		dpg_log_packet(task, DPG_TX, eh, ih6, ih, hl);
 
-	return 0;
+		return 0;
+	}
 }
 
 static void
@@ -2758,25 +2812,29 @@ static int
 dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 {
 	int rps;
+	double drop_rate;
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 	char rps_buf[32], rps_prev_buf[32], rps_lo_buf[32], rps_step_buf[32];
 
-	if (port->rps_max <= DPG_NO_DROP_RPS_MIN || !port->pdr) {
+	if (port->rps_max <= DPG_PDR_RPS_MIN || !port->pdr) {
 		return port->rps_max;
 	}
 
-	if (port->rps_cur < DPG_NO_DROP_RPS_MIN) {
-		return DPG_NO_DROP_RPS_MIN;
+	if (port->rps_cur < DPG_PDR_RPS_MIN) {
+		return DPG_PDR_RPS_MIN;
 	}
 
 	port->rps_tries++;
 
-	if (ipps + 1 >= opps ||  (opps - ipps) < port->pdr_percent * opps / 100) {
+	drop_rate = (double)port->drops * 100 / port->rps_cur;
+
+	if (drop_rate < port->pdr_percent) {
 		port->rps_seq++;
 	} else {
 		port->rps_seq = 0;
 	}
 
+	port->drops = 0;
 	rps = port->rps_cur;
 	
 	if (port->rps_seq == port->pdr_seq) {
@@ -2810,8 +2868,9 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 		dpg_print_human_readable(rps_lo_buf, sizeof(rps_lo_buf), port->rps_lo, 1);
 		dpg_print_human_readable(rps_step_buf, sizeof(rps_step_buf), port->rps_step, 1);
 
-		printf("%s: RPS: %s->%s (lo=%s, step=%s)\n",
-				port_name, rps_prev_buf, rps_buf, rps_lo_buf, rps_step_buf);
+		printf("%s: RPS: %s->%s (lo=%s, step=%s, drop=%.3f%%)\n",
+				port_name, rps_prev_buf, rps_buf, rps_lo_buf, rps_step_buf,
+				drop_rate);
 	}
 
 	return rps;
