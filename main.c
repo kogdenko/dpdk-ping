@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// Author: Konstantin Kogdenko
 
 #include <arpa/inet.h>
 #include <assert.h>
@@ -44,8 +43,8 @@
 #define DPG_DEFAULT_PDR_TRIES 30
 #define DPG_DEFAULT_PDR_SEQ 10
 
-#define DPG_PAYLOAD_PING 0x70696e67 //ping
-#define DPG_PAYLOAD_PONG 0x706f6e67 //pong"
+#define DPG_PAYLOAD_PING dpg_hton32(0x70696e67) //ping
+#define DPG_PAYLOAD_PONG dpg_hton32(0x706f6e67) //pong"
 
 #define DPG_LOG_BUFSIZE 512
 
@@ -405,7 +404,8 @@ struct dpg_port {
 
 	uint32_t send_seq;
 	uint32_t recv_seq;
-	uint32_t drops;
+	uint64_t drop_packets;
+	uint64_t drop_packets_prev;
 
 	uint64_t ipackets_prev;
 	uint64_t opackets_prev;
@@ -2492,11 +2492,13 @@ dpg_ip_input(struct dpg_task *task, struct rte_mbuf *m,
 	}
 
 	if (!echo) {
-		recv_seq = dpg_ntoh32(payload->seq);
-		if (port->recv_seq != recv_seq) {
-			port->drops++;
+		if (payload->dir == DPG_PAYLOAD_PONG) {
+			recv_seq = dpg_ntoh32(payload->seq);
+			if (port->recv_seq != recv_seq) {
+				port->drop_packets++;
+			}
+			port->recv_seq = recv_seq + 1;
 		}
-		port->recv_seq = recv_seq + 1;
 		return -ENOTSUP;
 	} else {
 		DPG_SWAP(ih->src_addr, ih->dst_addr);
@@ -2810,10 +2812,9 @@ drop:
 }
 
 static int
-dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
+dpg_compute_rps(struct dpg_port *port, uint64_t drop_pps)
 {
 	int rps;
-	double drop_rate;
 	char port_name[RTE_ETH_NAME_MAX_LEN];
 	char rps_buf[32], rps_prev_buf[32], rps_lo_buf[32], rps_step_buf[32];
 
@@ -2827,15 +2828,12 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 
 	port->rps_tries++;
 
-	drop_rate = (double)port->drops * 100 / port->rps_cur;
-
-	if (drop_rate < port->pdr_percent) {
+	if ((double)drop_pps * 100 / port->rps_cur  < port->pdr_percent) {
 		port->rps_seq++;
 	} else {
 		port->rps_seq = 0;
 	}
 
-	port->drops = 0;
 	rps = port->rps_cur;
 	
 	if (port->rps_seq == port->pdr_seq) {
@@ -2869,21 +2867,20 @@ dpg_compute_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 		dpg_print_human_readable(rps_lo_buf, sizeof(rps_lo_buf), port->rps_lo, 1);
 		dpg_print_human_readable(rps_step_buf, sizeof(rps_step_buf), port->rps_step, 1);
 
-		printf("%s: RPS: %s->%s (lo=%s, step=%s, drop=%.3f%%)\n",
-				port_name, rps_prev_buf, rps_buf, rps_lo_buf, rps_step_buf,
-				drop_rate);
+		printf("%s: RPS: %s->%s (lo=%s, step=%s)\n",
+				port_name, rps_prev_buf, rps_buf, rps_lo_buf, rps_step_buf);
 	}
 
 	return rps;
 }
 
 static void
-dpg_update_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
+dpg_update_rps(struct dpg_port *port, uint64_t drop_pps)
 {
 	int rps_per_task, rps_rem, rps_cur;
 	struct dpg_task *task;
 
-	rps_cur = dpg_compute_rps(port, ipps, opps);
+	rps_cur = dpg_compute_rps(port, drop_pps);
 
 	if (port->rps_cur == rps_cur) {
 		return;
@@ -2901,11 +2898,11 @@ dpg_update_rps(struct dpg_port *port, uint64_t ipps, uint64_t opps)
 
 static void
 dpg_get_stats(uint64_t *ipps_accum, uint64_t *ibps_accum,
-		uint64_t *opps_accum, uint64_t *obps_accum)
+		uint64_t *opps_accum, uint64_t *obps_accum, uint64_t *drop_pps_accum)
 {
 	int port_id;
 	uint64_t ip, ib, op, ob;
-	uint64_t ipps, ibps, opps, obps;
+	uint64_t ipps, ibps, opps, obps, drop_pps;
 	struct rte_eth_stats stats;
 	struct dpg_port *port;
 
@@ -2913,6 +2910,7 @@ dpg_get_stats(uint64_t *ipps_accum, uint64_t *ibps_accum,
 	*ibps_accum = 0;
 	*opps_accum = 0;
 	*obps_accum = 0;
+	*drop_pps_accum = 0;
 
 	DPG_FOREACH_PORT(port, port_id) {
 		if (port->software_counters) {
@@ -2941,23 +2939,28 @@ dpg_get_stats(uint64_t *ipps_accum, uint64_t *ibps_accum,
 		obps = ob - port->obytes_prev;
 		port->obytes_prev = ob;
 
-		dpg_update_rps(port, ipps, opps);
+		drop_pps = port->drop_packets - port->drop_packets_prev;
+		port->drop_packets_prev = port->drop_packets;
+
+		dpg_update_rps(port, drop_pps);
 
 		*ipps_accum += ipps;
 		*ibps_accum += ibps;
 		*opps_accum += opps;
 		*obps_accum += obps;
+		*drop_pps_accum += drop_pps;
 	}
 }
 
 static void
 dpg_print_report(double d_tsc)
 {
-	uint64_t ipps, ibps, opps, obps;
+	uint64_t ipps, ibps, opps, obps, drop_pps;
+	double drop_rate;
 	char ipps_b[40], ibps_b[40], opps_b[40], obps_b[40];
 	static int reports;
 
-	dpg_get_stats(&ipps, &ibps, &opps, &obps);
+	dpg_get_stats(&ipps, &ibps, &opps, &obps, &drop_pps);
 
 	if (reports == 20) {
 		reports = 0;
@@ -2971,7 +2974,7 @@ dpg_print_report(double d_tsc)
 		if (g_dpg_bflag) {
 			printf("%-12s", "obps");
 		}
-		printf("\n");
+		printf("drops\n");
 	}
 
 	dpg_print_human_readable(ipps_b, sizeof(ipps_b), ipps, 1);
@@ -2987,6 +2990,14 @@ dpg_print_report(double d_tsc)
 	if (g_dpg_bflag) {
 		printf("%-12s", obps_b);
 	}
+	if (opps == 0) {
+		drop_rate = 0;
+	} else if (opps < drop_pps) {
+		drop_rate = 100;
+	} else {
+		drop_rate = (double)drop_pps*100/opps;
+	}
+	printf("%.4lf%%", drop_rate);
 	printf("\n");
 
 	reports++;
@@ -3123,6 +3134,10 @@ main(int argc, char **argv)
 
 		dpg_eth_dev_info_get(port_id, &dev_info);
 
+		if (port->pdr && port->n_queues > 1) {
+			dpg_die("%s: pdr not implemented for multiqueue mode\n", port_name);
+		}
+
 		port->conf = port_conf;
 		if (dev_info.tx_offload_capa & DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE) {
 			port->conf.txmode.offloads |= DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
@@ -3213,7 +3228,7 @@ main(int argc, char **argv)
 					port_name, -rc, rte_strerror(-rc));
 		}
 
-		dpg_update_rps(port, 0, 0);
+		dpg_update_rps(port, 0);
 	}
 
 	signal(SIGINT, dpg_sighandler);
