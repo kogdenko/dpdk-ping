@@ -44,7 +44,7 @@
 
 #define DPG_PAYLOAD_MAGIC dpg_hton32(0x70696e67)
 
-#define DPG_LOG_BUFSIZE 512
+#define DPG_LOG_BUF_SIZE 512
 
 #define DPG_ETH_ADDRSTRLEN 18
 
@@ -406,6 +406,7 @@ struct dpg_port {
 	uint64_t drop_packets;
 	uint64_t drop_packets_prev;
 	uint64_t ping_packets;
+	uint64_t ping_packets_prev;
 	uint64_t pong_packets;
 	uint64_t pong_packets_prev;
 
@@ -445,6 +446,7 @@ static struct dpg_port *g_dpg_ports[RTE_MAX_ETHPORTS];
 static struct dpg_lcore g_dpg_lcores[RTE_MAX_LCORE];
 static struct rte_mempool *g_dpg_pktmbuf_pool;
 static int g_dpg_bflag;
+static bool g_dpg_human_readable_number = true;
 
 #define DPG_SWAP(a, b) do { \
 	typeof(a) t; \
@@ -492,6 +494,7 @@ static int g_dpg_bflag;
 	printf("%u: ", __LINE__); \
 	printf(f, ##__VA_ARGS__); \
 	printf("\n"); \
+	fflush(stdout); \
 } while (0)
 
 static void dpg_print_hexdump_ascii(const void *data, int count)
@@ -523,6 +526,53 @@ dpg_print_hexdump_ascii(const void *data, int count)
 			printf("%c", isprint(ch) ? ch : '.');
 		}
 		printf("\n");
+	}
+	fflush(stdout);
+}
+
+static int64_t
+dpg_parse_human_readable(const char *s)
+{
+	double val;
+	char *endptr, *unit;
+	static const char *units = "kmgt";
+
+	val = strtod(s, &endptr);
+	if (*endptr == '\0') {
+		return val;
+	} else {
+		unit = strchr(units, *endptr);
+		if (unit == NULL) {
+			return -EINVAL;
+		}
+		return val * pow(1000, (unit - units + 1));
+	}
+}
+
+static int
+dpg_print_human_readable5(char *buf, size_t count, double val, char *fmt)
+{
+	static const char *units[] = { "", "k", "m", "g", "t" };
+	int i;
+
+	if (g_dpg_human_readable_number) {
+		for (i = 0; val >=1000 && i < DPG_ARRAY_SIZE(units) - 1; i++) {
+			val /= 1000;
+		}
+	} else {
+		i = 0;
+	}
+
+	return snprintf(buf, count, fmt, val, units[i]);
+}
+
+static int
+dpg_print_human_readable(char *buf, size_t count, double val)
+{
+	if (g_dpg_human_readable_number) {
+		return dpg_print_human_readable5(buf, count, val, "%.3f%s");
+	} else {
+		return dpg_print_human_readable5(buf, count, val, "%.0f%s");
 	}
 }
 
@@ -745,6 +795,13 @@ dpg_strbuf_cstr(struct dpg_strbuf *sb)
 }
 
 static void
+dpg_strbuf_print(struct dpg_strbuf *sb)
+{
+	fprintf(stdout, "%s\n", dpg_strbuf_cstr(sb));
+	fflush(stdout);
+}
+
+static void
 dpg_strbuf_add(struct dpg_strbuf *sb, const void *buf, int size)
 {
 	int n;
@@ -811,6 +868,15 @@ dpg_strbuf_add_tcp_flags(struct dpg_strbuf *sb, uint8_t tcp_flags)
 	}
 }
 
+static void
+dpg_strbuf_add_human_readable(struct dpg_strbuf *sb, double val)
+{
+	int rc, cnt;
+
+	cnt = dpg_strbuf_space(sb);
+	rc = dpg_print_human_readable(sb->buf + sb->len, cnt, val);
+	sb->len += rc;
+}
 
 static void
 dpg_darray_init(struct dpg_darray *da, int item_size)
@@ -1082,9 +1148,13 @@ dpg_parse_bool(char *str)
 			return b;
 		}
 	}
-	if (!strcasecmp(str, "on") || !strcasecmp(str, "yes")) {
+	if (!strcasecmp(str, "on") ||
+	    !strcasecmp(str, "yes") ||
+	    !strcasecmp(str, "true")) {
 		return 1;
-	} else if (!strcasecmp(str, "off") || !strcasecmp(str, "no")) {
+	} else if (!strcasecmp(str, "off") ||
+	           !strcasecmp(str, "no") ||
+	           !strcasecmp(str, "false")) {
 		return 0;
 	} else {
 		return -EINVAL;
@@ -1341,52 +1411,6 @@ dpg_ipv4_udp_cksum(struct dpg_ipv4_hdr *ih, void *l4_hdr, int len)
 	return reduced;
 }
 
-static void
-dpg_print_human_readable5(char *buf, size_t count, double val, char *fmt, int normalize)
-{
-	static const char *units[] = { "", "k", "m", "g", "t" };
-	int i;
-
-	if (normalize) {
-		for (i = 0; val >=1000 && i < DPG_ARRAY_SIZE(units) - 1; i++) {
-			val /= 1000;
-		}
-	} else {
-		i = 0;
-	}
-
-	snprintf(buf, count, fmt, val, units[i]);
-}
-
-static int64_t
-dpg_parse_human_readable(const char *s)
-{
-	double val;
-	char *endptr, *unit;
-	static const char *units = "kmgt";
-
-	val = strtod(s, &endptr);
-	if (*endptr == '\0') {
-		return val;
-	} else {
-		unit = strchr(units, *endptr);
-		if (unit == NULL) {
-			return -EINVAL;
-		}
-		return val * pow(1000, (unit - units + 1));
-	}
-}
-
-static void
-dpg_print_human_readable(char *buf, size_t count, double val, int normalize)
-{
-	if (normalize) {
-		dpg_print_human_readable5(buf, count, val, "%.3f%s", normalize);
-	} else {
-		dpg_print_human_readable5(buf, count, val, "%.0f%s", normalize);
-	}
-}
-
 static const char *
 dpg_icmp_type_string(int icmp_type)
 {
@@ -1442,7 +1466,7 @@ dpg_log_packet(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dp
 {
 	char sabuf[INET6_ADDRSTRLEN];
 	char dabuf[INET6_ADDRSTRLEN];
-	char logbuf[DPG_LOG_BUFSIZE];
+	char logbuf[DPG_LOG_BUF_SIZE];
 	struct dpg_strbuf sb;
 	struct dpg_port *port;
 	struct dpg_icmp_hdr *ich;
@@ -1494,7 +1518,7 @@ dpg_log_packet(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dp
 		break;
 	}
 
-	printf("%s\n", dpg_strbuf_cstr(&sb));
+	dpg_strbuf_print(&sb);
 }
 
 static void
@@ -1505,7 +1529,7 @@ dpg_log_arp(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_a
 	char sibuf[INET_ADDRSTRLEN];
 	char thbuf[DPG_ETH_ADDRSTRLEN];
 	char shbuf[DPG_ETH_ADDRSTRLEN];
-	char logbuf[DPG_LOG_BUFSIZE];
+	char logbuf[DPG_LOG_BUF_SIZE];
 	struct dpg_strbuf sb;
 	struct dpg_port *port;
 
@@ -1528,7 +1552,7 @@ dpg_log_arp(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_a
 			is_req ? "request" : "reply",
 			sibuf, shbuf, tibuf, thbuf);
 
-	printf("%s\n", dpg_strbuf_cstr(&sb));
+	dpg_strbuf_print(&sb);
 }
 
 static void
@@ -1537,7 +1561,7 @@ dpg_log_ipv6(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_
 {
 	char srcbuf[INET6_ADDRSTRLEN];
 	char dstbuf[INET6_ADDRSTRLEN];
-	char logbuf[DPG_LOG_BUFSIZE];
+	char logbuf[DPG_LOG_BUF_SIZE];
 	struct dpg_strbuf sb;
 	struct dpg_port *port;
 
@@ -1555,13 +1579,13 @@ dpg_log_ipv6(struct dpg_task *task, int dir, struct dpg_eth_hdr *eh, struct dpg_
 
 	dpg_strbuf_addf(&sb, ": %s->%s: %s", srcbuf, dstbuf, desc);
 
-	printf("%s\n", dpg_strbuf_cstr(&sb));
+	dpg_strbuf_print(&sb);
 }
 
 static void
 dpg_log_custom(struct dpg_task *task, struct dpg_eth_hdr *eh, const char *proto)
 {
-	char logbuf[DPG_LOG_BUFSIZE];
+	char logbuf[DPG_LOG_BUF_SIZE];
 	struct dpg_strbuf sb;
 	struct dpg_port *port;
 
@@ -1576,7 +1600,7 @@ dpg_log_custom(struct dpg_task *task, struct dpg_eth_hdr *eh, const char *proto)
 
 	dpg_strbuf_addf(&sb, ": %s packet", proto);
 
-	printf("%s\n", dpg_strbuf_cstr(&sb));
+	dpg_strbuf_print(&sb);
 }
 
 static uint64_t
@@ -1809,6 +1833,9 @@ dpg_create_task(struct dpg_port *port, uint16_t lcore_id, uint16_t queue_id)
 	DPG_DLIST_INSERT_HEAD(&port->task_head, task, plist);
 }
 
+#define DPG_AS(s) dpg_strbuf_adds(&sb, s)
+#define DPG_AF(fmt, ...) dpg_strbuf_addf(&sb, fmt, __VA_ARGS__)
+
 static void
 dpg_print_usage(void)
 {
@@ -1817,76 +1844,88 @@ dpg_print_usage(void)
 	char rate_buf[32];
 	char eth_addr_buf[DPG_ETH_ADDRSTRLEN];
 	char port_name[RTE_ETH_NAME_MAX_LEN];
+	char usage_buf[4096];
+	struct dpg_strbuf sb;
 
-	dpg_print_human_readable(rate_buf, sizeof(rate_buf), DPG_DEFAULT_RPS, 1);
+	dpg_strbuf_init(&sb, usage_buf, sizeof(usage_buf));
 
-	printf("Usage: dpdk-ping [DPDK options] -- port options [-- port options ...]\n"
-	"\n"
-	"Port options:\n"
-	"\t-h|--help:  Print this help\n"
-	"\t-V {level}:  Be verbose (default: 0)\n"
-	"\t-b {bool}:  Print bits/sec in report (default: %s)\n"
-	"\t-l {lcore id..}:  Lcores to run on\n"
-	"\t-p {port name}:  Port to run on\n"
-	"\t-R {bool}:  Send ICMP echo requests (default: %s)\n"
-	"\t-E {bool}:  Send ICMP echo reply on incoming ICMP echo requests (default: %s)\n"
-	"\t-4 {IP..}:  Interaface IP address iterator\n"
-	"\t-6 {IPv6..}:  Interface IPv6 address iterator\n"
-	"\t-B {packets per second}:  ICMP requests bandwidth (default:%s)\n"
-	"\t-H {ether address}:  Destination ethernet address (default: ff:ff:ff:ff:ff:ff)\n"
-	"\t-s {IP..}:  Source ip addresses iterator (default: %s)\n"
-	"\t-d {IP..}:  Destination ip addresses iterator (default: %s)\n"
-	"\t-S {port..}:  Source port iterator (default: %s)\n"
-	"\t-D {port..}:  Destination port iterator (default: %s)\n"
-	"\t-L {bytes}:  Packet size (default: %d)\n"
-	"\t--rx-verbose {level}:  Be verbose on rx path (default: %d)\n"
-	"\t--tx-verbose {level}:  Be verbose on tx path (default: %d)\n"
-	"\t--udp:  Send UDP packets\n"
-	"\t--tcp:  Send TCP SYN packets\n"
-	"\t--icmp:  Send ICMP echo packets\n"
-	"\t--icmp-id {id..}:  ICMP request id iterator (default: %s)\n"
-	"\t--icmp-seq {seq..}:  ICMP request sequence iterator (default: %s)\n"
-	"\t--srv6-src {IPv6}:  SRv6 tunnel source address\n"
-	"\t--srv6-dst {IPv6..}:  SRv6 tunnel destination address iterator\n"
-	"\t--software-counters {bool}:  Use software counters for reports (default: %s)\n"
-	"\t--pdr {%%,[t]]}:  Specify partial drop rate rate parameters (default: %f,%u)\n"
-	"\t--rand:  Iterate sessions randomly\n"
-	"\t--rand-seed {number}:  Specify random generator seed\n"
-	"\t--rand-sessions {number}: Specify _approximate_ random sessions number\n"
-	"\tIterator of values x (x..):  {x,x,x...|x-x}\n"
-	"Ports:\n",
-		dpg_bool_str(g_dpg_bflag),
-		dpg_bool_str(false),
-		dpg_bool_str(false),
-		rate_buf,
-		DPG_DEFAULT_SRC_IP,
-		DPG_DEFAULT_DST_IP,
-		DPG_DEFAULT_SRC_PORT,
-		DPG_DEFAULT_DST_PORT,
-		DPG_DEFAULT_PKT_LEN,
-		0,
-		0,
-		DPG_DEFAULT_ICMP_ID,
-		DPG_DEFAULT_ICMP_SEQ,
-		dpg_bool_str(0),
-		DPG_DEFAULT_PDR_PERCENT,
-		DPG_DEFAULT_PDR_PERIOD
-	);
+	dpg_print_human_readable(rate_buf, sizeof(rate_buf), DPG_DEFAULT_RPS);
 
+	DPG_AS("Usage: dpdk-ping [DPDK options] -- port options [-- port options ...]\n\n");
+	DPG_AS("Port options:\n");
+	DPG_AS("\t-h|--help:  Print this help\n");
+	DPG_AS("\t-V {level}:  Be verbose (default: 0)\n");
+	DPG_AF("\t-b {bool}:  Print bits/sec in report (default: %s)\n",
+			dpg_bool_str(g_dpg_bflag));
+	DPG_AS("\t-l {lcore id..}:  Lcores to run on\n");
+	DPG_AS("\t-p {port name}:  Port to run on\n");
+	DPG_AF("\t-R {bool}:  Send ICMP echo requests (default: %s)\n",
+			dpg_bool_str(false));
+	DPG_AF("\t-E {bool}:  Send ICMP echo reply on incoming ICMP echo requests (default: %s)\n",
+			dpg_bool_str(false));	
+	DPG_AS("\t-4 {IP..}:  Interaface IP address iterator\n");
+	DPG_AS("\t-6 {IPv6..}:  Interface IPv6 address iterator\n");
+	DPG_AF("\t-B {pps}:  ICMP requests bandwidth (default:%s)\n", rate_buf);
+	DPG_AS("\t-H {ether address}:  Destination ethernet address "
+			"(default: ff:ff:ff:ff:ff:ff)\n");
+	DPG_AS("\t-g {IP}:  Gateway ip address\n");
+	DPG_AF("\t-s {IP..}:  Source ip addresses iterator (default: %s)\n", 
+			DPG_DEFAULT_SRC_IP);
+	DPG_AF("\t-d {IP..}:  Destination ip addresses iterator (default: %s)\n",
+			DPG_DEFAULT_DST_IP);
+	DPG_AF("\t-S {port..}:  Source port iterator (default: %s)\n",
+			DPG_DEFAULT_SRC_PORT);
+	DPG_AF("\t-D {port..}:  Destination port iterator (default: %s)\n",
+			DPG_DEFAULT_DST_PORT);
+	DPG_AF("\t-L {bytes}:  Packet size (default: %d)\n", DPG_DEFAULT_PKT_LEN);
+	DPG_AS("\t--rx-verbose {level}:  Be verbose on rx path (default: 0)\n");
+	DPG_AS("\t--tx-verbose {level}:  Be verbose on tx path (default: 0)\n");
+	DPG_AF("\t--human-readable-number {bool}:  Use Kilo,Mega,Giga number representation "
+			"(default: %s)\n", dpg_bool_str(g_dpg_human_readable_number));
+	DPG_AS("\t--udp:  Send UDP packets\n");
+	DPG_AS("\t--tcp:  Send TCP SYN packets\n");
+	DPG_AS("\t--icmp:  Send ICMP echo packets\n");
+	DPG_AF("\t--icmp-id {id..}:  ICMP request id iterator (default: %s)\n",
+			DPG_DEFAULT_ICMP_ID);
+	DPG_AF("\t--icmp-seq {seq..}:  ICMP request sequence iterator (default: %s)\n",
+			DPG_DEFAULT_ICMP_SEQ);
+	DPG_AS("\t--srv6-src {IPv6}:  SRv6 tunnel source address\n");
+	DPG_AS("\t--srv6-dst {IPv6..}:  SRv6 tunnel destination address iterator\n");
+	DPG_AF("\t--software-counters {bool}:  Use software counters for reports (default: %s)\n",
+			dpg_bool_str(false));
+	DPG_AS("\t--pdr:  Enable partial drop rate rate mode\n");
+	DPG_AF("\t--pdr-period  {seconds}:  specify patrial drop rate measurment period (default: %d)\n",
+			DPG_DEFAULT_PDR_PERIOD);
+	DPG_AF("\t--pdr-percent {percent}:  Specify partial drop rate percentage (default: %f)\n",
+			DPG_DEFAULT_PDR_PERCENT);
+	DPG_AF("\t--pdr-start {rps}:  Specify initail pdr rps (default: %d)\n",
+			DPG_DEFAULT_PDR_RPS);
+	DPG_AS("\t--pdr-step {rps}:  Specify initial pdr step (default: 0)\n");
+	DPG_AS("\t--rand:  Iterate sessions randomly\n");
+	DPG_AS("\t--rand-seed {number}:  Specify random generator seed\n");
+	DPG_AS("\t--rand-sessions {number}: Specify _approximate_ random sessions number\n");
+	DPG_AS("\tIterator of values x (x..):  {x,x,x...|x-x}\n");
+	DPG_AS("Ports:\n");
+		
 	RTE_ETH_FOREACH_DEV(port_id) {
 		rte_eth_dev_get_name_by_port(port_id, port_name);
-		printf("%s", port_name);
+		DPG_AS(port_name);
 
 		rc = dpg_eth_macaddr_get(port_id, &mac_addr);
 		if (rc == 0) {
 			dpg_eth_format_addr(eth_addr_buf, sizeof(eth_addr_buf), &mac_addr);
-			printf("  %s", eth_addr_buf);
+			DPG_AF("  %s", eth_addr_buf);
 		}
-		printf("\n");
+		DPG_AS("\n");
 	}
+
+	dpg_strbuf_print(&sb);
 
 	rte_exit(EXIT_SUCCESS, "\n");
 }
+
+#undef DPG_AS
+#undef DPG_AF
 
 static int
 dpg_parse_port(int argc, char **argv)
@@ -1905,6 +1944,7 @@ dpg_parse_port(int argc, char **argv)
 		{ "help", no_argument, 0, 'h' },
 		{ "rx-verbose", required_argument, 0, 0 },
 		{ "tx-verbose", required_argument, 0, 0 },
+		{ "human-readable-number", required_argument, 0, 0 },
 		{ "udp", no_argument, 0, 0 },
 		{ "tcp", no_argument, 0, 0 },
 		{ "icmp", no_argument, 0, 0 },
@@ -1938,6 +1978,12 @@ dpg_parse_port(int argc, char **argv)
 				port->verbose[DPG_RX] = strtoul(optarg, NULL, 10);
 			} else if (!strcmp(optname, "tx-verbose")) {
 				port->verbose[DPG_TX] = strtoul(optarg, NULL, 10);
+			} else if (!strcmp(optname, "human-readable-number")) {
+				rc = dpg_parse_bool(optarg);
+				if (rc < 0) {
+					dpg_invalid_argument(0, optname);
+				}
+				g_dpg_human_readable_number = rc;
 			} else if (!strcmp(optname, "udp")) {
 				port->proto = IPPROTO_UDP;
 			} else if (!strcmp(optname, "tcp")) {
@@ -2627,17 +2673,12 @@ dpg_ip_input(struct dpg_task *task, struct rte_mbuf *m,
 		if (payload->payload_magic == DPG_PAYLOAD_MAGIC) {
 			if (port->pdr) {
 				recv_seq = dpg_ntoh32(payload->payload_seq);
-				if (port->recv_seq == recv_seq) {
-					//dpg_dbg("++ %u ", recv_seq);
-					port->pong_packets++;
-				} else {
-					//dpg_dbg("!! %llu", (unsigned long long)port->drop_packets );
+				if (port->recv_seq != recv_seq) {
 					port->drop_packets++;
 				}
 				port->recv_seq = recv_seq + 1;
-			} else {
-				port->pong_packets++;
 			}
+			port->pong_packets++;
 		} else {
 			port->drop_packets++;
 		}
@@ -2983,8 +3024,9 @@ dpg_compute_rps(struct dpg_port *port)
 {
 	int rps, dir;
 	char port_name[RTE_ETH_NAME_MAX_LEN];
-	double dpong, ddrop, drop_percent;
-	char rps_buf[32], rps_prev_buf[32], rps_step_buf[32];
+	double dping, dpong, ddrop, drop_percent;
+	char log_buf[DPG_LOG_BUF_SIZE];
+	struct dpg_strbuf sb;
 
 	if (!port->pdr) {
 		return port->rps_max;
@@ -2997,13 +3039,14 @@ dpg_compute_rps(struct dpg_port *port)
 		return port->rps;
 	}
 
+	dping = port->ping_packets - port->ping_packets_prev;
 	dpong = port->pong_packets - port->pong_packets_prev;
 	ddrop = port->drop_packets - port->drop_packets_prev;
 
-	if (dpong == 0) {
+	if (dpong < dping/2) {
 		drop_percent = 100;
 	} else {
-		drop_percent = 100*((double)ddrop/dpong);
+		drop_percent = 100*((double)ddrop/DPG_MAX(dping, dpong));
 	}
 
 	if (drop_percent > port->pdr_percent) {
@@ -3038,6 +3081,7 @@ dpg_compute_rps(struct dpg_port *port)
 	rps = port->rps + dir * port->pdr_step;
 
 out:
+	port->ping_packets_prev = port->ping_packets;
 	port->pong_packets_prev = port->pong_packets;
 	port->drop_packets_prev = port->drop_packets;
 	port->pdr_elapsed = 0;
@@ -3048,12 +3092,17 @@ out:
 	if (rps != port->rps) {
 		rte_eth_dev_get_name_by_port(port->id, port_name);
 
-		dpg_print_human_readable(rps_prev_buf, sizeof(rps_prev_buf), port->rps, 1);
-		dpg_print_human_readable(rps_buf, sizeof(rps_buf), rps, 1);
-		dpg_print_human_readable(rps_step_buf, sizeof(rps_step_buf), port->pdr_step, 1);
+		dpg_strbuf_init(&sb, log_buf, sizeof(log_buf));
 
-		printf("%s: RPS: %s->%s (step=%s, drops=%.3lf)\n",
-				port_name, rps_prev_buf, rps_buf, rps_step_buf, drop_percent);
+		dpg_strbuf_addf(&sb, "%s: RPS: ", port_name);
+		dpg_strbuf_add_human_readable(&sb, port->rps);
+		dpg_strbuf_adds(&sb, "->");
+		dpg_strbuf_add_human_readable(&sb, rps);
+		dpg_strbuf_adds(&sb, " (step=");
+		dpg_strbuf_add_human_readable(&sb, port->pdr_step);
+		dpg_strbuf_addf(&sb, ", drops=%.3lf)", drop_percent);
+
+		dpg_strbuf_print(&sb);
 	}
 
 	return rps;
@@ -3145,39 +3194,43 @@ dpg_print_report(double d_tsc)
 {
 	uint64_t ipps, ibps, opps, obps;
 	char ipps_b[40], ibps_b[40], opps_b[40], obps_b[40];
+	char log_buf[DPG_LOG_BUF_SIZE];
+	struct dpg_strbuf sb;
 	static int reports;
 
 	dpg_get_stats(&ipps, &ibps, &opps, &obps);
+
+	dpg_strbuf_init(&sb, log_buf, sizeof(log_buf));
 
 	if (reports == 20) {
 		reports = 0;
 	}
 	if (reports == 0) {
-		printf("%-12s", "ipps");
+		dpg_strbuf_addf(&sb, "%-12s", "ipps");
 		if (g_dpg_bflag) {
-			printf("%-12s", "ibps");
+			dpg_strbuf_addf(&sb, "%-12s", "ibps");
 		}
-		printf("%-12s", "opps");
+		dpg_strbuf_addf(&sb, "%-12s", "opps");
 		if (g_dpg_bflag) {
-			printf("%-12s", "obps");
+			dpg_strbuf_addf(&sb, "%-12s", "obps");
 		}
-		printf("\n");
+		dpg_strbuf_adds(&sb, "\n");
 	}
 
-	dpg_print_human_readable(ipps_b, sizeof(ipps_b), ipps, 1);
-	dpg_print_human_readable(ibps_b, sizeof(ibps_b), ibps, 1);
-	dpg_print_human_readable(opps_b, sizeof(opps_b), opps, 1);
-	dpg_print_human_readable(obps_b, sizeof(obps_b), obps, 1);
-
-	printf("%-12s", ipps_b);
+	// TODO: add width to dpg_strbuf_add_human_readable
+	dpg_print_human_readable(ipps_b, sizeof(ipps_b), ipps);
+	dpg_strbuf_addf(&sb, "%-12s", ipps_b);
 	if (g_dpg_bflag) {
-		printf("%-12s", ibps_b);
+		dpg_print_human_readable(ibps_b, sizeof(ibps_b), ibps);
+		dpg_strbuf_addf(&sb, "%-12s", ibps_b);
 	}
-	printf("%-12s", opps_b);
+	dpg_print_human_readable(opps_b, sizeof(opps_b), opps);
+	dpg_strbuf_addf(&sb, "%-12s", opps_b);
 	if (g_dpg_bflag) {
-		printf("%-12s", obps_b);
+		dpg_print_human_readable(obps_b, sizeof(obps_b), obps);
+		dpg_strbuf_addf(&sb, "%-12s", obps_b);
 	}
-	printf("\n");
+	dpg_strbuf_print(&sb);
 
 	reports++;
 }
@@ -3221,6 +3274,7 @@ dpg_print_port_stat(struct dpg_port *port)
 	dpg_print_port_stat_counter("ierrors", stats.ierrors, 0, NULL);
 	dpg_print_port_stat_counter("oerrors", stats.oerrors, 0, NULL);
 	dpg_print_port_stat_counter("rx_nombuf", stats.rx_nombuf, 0, NULL);
+	fflush(stdout);
 }
 
 static void
@@ -3401,11 +3455,7 @@ main(int argc, char **argv)
 
 		rte_eth_promiscuous_enable(port_id);
 
-		rc = rte_eth_dev_set_link_up(port_id);
-		if (rc < 0) {
-			printf("rte_eth_dev_set_link_up('%s') failed (%d:%s)\n",
-					port_name, -rc, rte_strerror(-rc));
-		}
+		rte_eth_dev_set_link_up(port_id);
 
 		dpg_set_rps(port, port->rps);
 	}
