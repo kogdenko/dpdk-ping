@@ -20,25 +20,14 @@ Run dpdk-ping:
 
 Pair of dpdk-ping
 -----------------
-Find out hardware addresses:
-```
-./dpdk-ping --proc-type=primary --file-prefix=pmd1 --vdev=net_memif,role=server,socket=/run/memif.sock,socket-abstract=no -- -h
-...
-Ports:
-net_memif  96:39:81:9A:CC:4B
-
-./dpdk-ping --proc-type=primary --file-prefix=pmd2 --vdev=net_memif,socket=/run/memif.sock,socket-abstract=no -- -h
-...
-Ports:
-net_memif  DE:7C:86:CE:91:AD
 ```
 Run Server side:
 ```
 unlink /run/memif.sock
-./dpdk-ping --proc-type=primary --file-prefix=pmd1 --vdev=net_memif,role=server,socket=/run/memif.sock,socket-abstract=no -- -l 1 -p net_memif -E on
+./dpdk-ping --proc-type=primary --file-prefix=pmd1 --vdev=net_memif,role=server,socket=/run/memif.sock,socket-abstract=no -- -l 1 -p net_memif -E on 
 ```
 Run client side:
 ```
-./dpdk-ping --proc-type=primary --file-prefix=pmd2 --vdev=net_memif,socket=/run/memif.sock,socket-abstract=no -- -l 2 -H CA:F8:4C:23:DA:EB -B 1 -p net_memif --pdr 0.001,20,5 -B 10m -R on
+./dpdk-ping --proc-type=primary --file-prefix=pmd2 --vdev=net_memif,socket=/run/memif.sock,socket-abstract=no -- -l 2 -H CA:F8:4C:23:DA:EB -B 1 -p net_memif -B 10m -R on
 ```
 

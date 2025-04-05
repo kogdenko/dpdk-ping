@@ -1,6 +1,5 @@
 #!/usr/bin/python
 
-import argparse
 import os
 import psutil
 import queue
@@ -33,6 +32,8 @@ class DpdkPingInterface:
     def __init__(self, name, index):
         self.name = name
         self.index = index
+        self.quiet = False
+        self.lcore = 0
         self.smac = "22:4d:d9:98:03:%02x" % (index + 1)
         self.dmac = None
         self.sip = "10.0.0.100"
@@ -50,18 +51,25 @@ class DpdkPingInterface:
     def init(self):
         self.socket = conf.L2socket(iface=self.name)
 
-    def args(self):
-        args = "-p net_tap%d -l 0" % self.index
+    def ping_args(self):
+        args = "-p %s -l %d" % (self.dpdk_name, self.lcore)
 
         if self.request:
             args += " -R 1"
         else:
             args += " -E 1"
 
-        args += " -B %d -s %s -d %s" % (self.bandwidth, self.sip, self.dip)
+        args += " -B %d" % self.bandwidth
+        if self.sip != None:
+            args += " -s %s" % self.sip
+        if self.dip:
+            args += " -d %s" % self.dip
 
         if VERBOSE != None:
             args += " -V %d" % VERBOSE
+
+        if self.quiet:
+            args += " --quiet"
 
         if self.gateway != None:
             args += " -g %s" % self.gateway
@@ -81,12 +89,53 @@ class DpdkPingInterface:
 
         return args
 
+    def wait(self):
+        pass
+
+class DpdkPingMemifInterface(DpdkPingInterface):
+    def __init__(self, name, index, role):
+        super().__init__(name, index)
+        self.role = role
+        self.dpdk_name = name
+
+    def dpdk_args(self):
+        path = "/run/%s.sock" % self.name
+        if self.role == "server":
+            try:
+                os.unlink(path)
+            except:
+                pass
+        return ("--vdev=%s,role=%s,socket=%s,socket-abstract=no" %
+            (self.name, self.role, path))
+
+class DpdkPingTapInterface(DpdkPingInterface):
+    def __init__(self, name, index):
+        super().__init__(name, index)
+        self.dpdk_name = "net_tap%d" % index
+
+    def dpdk_args(self):
+        return ("--vdev=net_tap%d,iface=%s,mac=%s" %
+                (self.index, self.name, self.smac))
+
     def recv(self, count=1, filter="", timeout=1):
         return sniff(iface=self.name, count=count, filter=filter,
             timeout=timeout)
 
     def send(self, pkt):
          self.socket.send(pkt)#, iface=self.name)
+
+    def wait(self):
+        while True:
+            assert(not self.inst.done)
+            addrs =  psutil.net_if_addrs()
+            if self.name in addrs.keys():
+                for sa in addrs[self.name]:
+                    if sa.family == socket.AF_PACKET:
+                        self.dmac = sa.address
+                assert(self.dmac != None)
+                self.init()
+                break
+            time.sleep(0.1)
 
     def wait_pdr_report(self, echo=True):
         while not self.rps.empty():
@@ -101,81 +150,129 @@ class DpdkPingInterface:
 
         return self.rps.get()
 
+class DpdkPingInstance():
+    def __init__(self, index):
+        self.index = index
+        self.duration = None
+        self.done = False
+        self.omit = None
+        self.o = []
+        self.interfaces = []
 
-class TestDpdkPing(unittest.TestCase):
-    def create_dpg_intf(self):
-        assert(self.intf == None)
-        self.intf = DpdkPingInterface("dpg0", 0)
-        return self.intf
+    def add_interface(self, intf):
+            intf.inst = self
+            self.interfaces.append(intf)
 
-    def monitor_dpg(self):
+    def get_interface(self, dpdk_name):
+        for intf in self.interfaces:
+            if intf.dpdk_name == dpdk_name:
+                return intf
+        return None
+
+    def monitor(self):
+        stat = False
+
         while self.proc.poll() is None:
-            line = self.proc.stdout.readline().decode("utf-8").strip()
-
-            m = re.search(r'RPS: (\d+)->(\d+)', line)
-            if m != None:
-                self.intf.rps.put(int(m.group(2)))
-
+            line = self.proc.stdout.readline().decode("utf-8").strip("\n")
+            
+            if not stat:
+                m = re.search(r'(.+): RPS: (\d+)->(\d+)', line) # \(step=(\d+), drops=(\d+)\)$', line)
+                if m != None:
+                    intf = self.get_interface(m.group(1));
+                    if intf != None:
+                        intf.rps.put(int(m.group(3)))
+                    continue
+                m = re.search(r'^ifname,', line)
+                if m != None:
+                    stat = 1
+                    o = line.split(",")[1:]
+                    if len(self.o):
+                        assert(self.o == o)
+                    self.o = o
+                    continue
+            elif stat:
+                if len(line) != 0 and len(self.o) != 0:
+                    output = line.split(",")
+                    assert(len(output) - 1 == len(self.o))
+                    intf = self.get_interface(output[0])
+                    if intf != None:
+                        intf.output = dict(zip(self.o, output[1:]))
+                    
             if VERBOSE != None:
                 print(line)
+        self.done = True
 
-        if not self.down:
-            print(("Process unexpectedly closed with status %d" %
-                self.proc.returncode))
-            os._exit(1)
+    def start(self):
+        self.comm = "./dpdk-ping --no-pci --proc-type=primary --file-prefix=dpg%d" % self.index
+        for intf in self.interfaces:
+            self.comm += " "
+            self.comm += intf.dpdk_args()
 
-    def start_dpg(self):
-        assert(self.intf != None)
-        intf = self.intf 
-        args = "./dpdk-ping -m 10000 --no-huge --no-pci "
-        args += ("--vdev=net_tap%d,iface=%s,mac=%s" %
-            (intf.index, intf.name, intf.smac))
-        args += " -- --human-readable-number 0"
+        self.comm += " -- --human-readable 0"
+        if self.omit != None:
+            self.comm += " --omit %d" % self.omit
 
-        args += " "
-        args += self.intf.args()
+        if len(self.o):
+            self.comm += " -o " + ','.join(self.o)
+
+        if self.duration != None:
+            self.comm += " -t %d" % self.duration
+
+        for intf in self.interfaces:
+            self.comm += " "
+            self.comm += intf.ping_args()
 
         if VERBOSE != None:
             print("")
-            print(args)
+            print(self.comm)
 
-        self.proc = subprocess.Popen(args.split(),
+        self.proc = subprocess.Popen(self.comm.split(),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
-        self.thread = threading.Thread(target=self.monitor_dpg)
+        self.thread = threading.Thread(target=self.monitor)
         self.thread.start()
 
-        while True:
-            addrs =  psutil.net_if_addrs()
-            if self.intf.name in addrs.keys():
-                for sa in addrs[self.intf.name]:
-                    if sa.family == socket.AF_PACKET:
-                        self.intf.dmac = sa.address
-                assert(self.intf.dmac != None)
-                self.intf.init()
-                break
-           
-            time.sleep(0.1)
+        for intf in self.interfaces:
+            intf.wait()
 
-    def setUp(self):
+    def wait(self, timeout=None):
+        self.thread.join()
+        self.proc.communicate(timeout=timeout)
         self.proc = None
-        self.intf = None
-        self.down = False
 
-    def tearDown(self):
-        self.down = True
+    def stop(self):
         if self.proc != None:
             self.proc.kill()
-            self.thread.join()
-            self.proc.communicate(timeout=10)
-            self.proc = None
-        self.intf = None
+            self.wait(10)
+
+class TestDpdkPing(unittest.TestCase):
+    def create_tap(self, index):
+        return DpdkPingTapInterface("dpg%d" % index, index)
+
+    def create_memif(self, index, role):
+        return DpdkPingMemifInterface("net_memif%d" % index, index, role)
+
+    def create_instance(self):
+        index = len(self.instances)
+        inst = DpdkPingInstance(index)
+        self.instances.append(inst)
+        return inst
+
+    def setUp(self):
+        self.instances = []
+
+    def tearDown(self):
+        for inst in self.instances:
+            inst.stop()
+            inst.interfaces = []
         conf.ifaces.reload()
 
     def test_arp(self):
-        if0 = self.create_dpg_intf()
+        inst = self.create_instance()
+        if0 = self.create_tap(0)
         if0.gateway = "10.0.0.1"
-        self.start_dpg()
+        inst.add_interface(if0)
+        inst.start()
         capture = if0.recv(1, "arp")
         self.assertEqual(len(capture), 1)
         c = capture[0]
@@ -198,12 +295,14 @@ class TestDpdkPing(unittest.TestCase):
         self.assertEqual(c[IP].dst, if0.dip)
 
     def test_pdr(self):
-        if0 = self.create_dpg_intf()
+        inst = self.create_instance()
+        if0 = self.create_tap(0)
+        inst.add_interface(if0)
         if0.bandwidth = 1000
         if0.pdr_start = 5
         if0.pdr_period = 2
         if0.pdr_percent = 50
-        self.start_dpg()
+        inst.start()
 
         # Slow start
         rps = if0.wait_pdr_report()
@@ -229,14 +328,45 @@ class TestDpdkPing(unittest.TestCase):
         rps = if0.wait_pdr_report()
         self.assertEqual(rps, 19)
 
+    def test_memif(self):
+        inst0 = self.create_instance()
+        if0 = self.create_memif(0, "server")
+        if0.lcore = 1
+        if0.sip = None
+        if0.dip = None
+        if0.request = False
+        if0.quiet = True
+        inst0.add_interface(if0)
+        inst0.start()
+
+        time.sleep(1)
+
+        inst1 = self.create_instance()
+        if1 = self.create_memif(0, "client")
+        if1.lcore = 2
+        if1.sip = None
+        if1.dip = None
+        if1.bandwidth = 10000000
+        inst1.duration = 12
+        inst1.omit = 2
+        inst1.o = ["ipps", "opps", "requests", "replies"]
+        inst1.add_interface(if1)
+        inst1.start()
+
+        inst1.wait()
+        self.assertAlmostEqual(if1.output["requests"], if1.output["replies"], 6)
+        
 
 if __name__ == '__main__':
     conf.verb = 0
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-v', dest='verbose', action='count')
-    args, _ = parser.parse_known_args()
-    if args.verbose != None and args.verbose > 1:
-        VERBOSE = args.verbose - 2
+    VERBOSE = os.environ.get('VERBOSE')
+    if VERBOSE != None:
+        VERBOSE = int(VERBOSE)
 
-    unittest.main()
+    try:
+        unittest.main()
+    except KeyboardInterrupt:
+        pass
+
+    sys.exit(0)
