@@ -3154,10 +3154,11 @@ dpg_do_ping(struct dpg_port *port, struct dpg_task *task)
 		if (rc == 0) {
 			dpg_set_eth_hdr_addresses(port, m);
 			rte_pktmbuf_free(m);
+
 			m = dpg_create_request(task);
 
-			if (!dpg_tx_queue_full(&task->req_queue)) {
-				dpg_tx_queue_add(&task->req_queue, m);
+			if (!dpg_tx_queue_full(&task->rpl_queue)) {
+				dpg_tx_queue_add(&task->rpl_queue, m);
 				continue;
 			}
 		}
