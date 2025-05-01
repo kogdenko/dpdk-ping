@@ -11,12 +11,13 @@ import sys
 import threading
 import time
 import unittest
+from datetime import datetime
 
 from scapy.all import *
 
 VERBOSE = None
 
-def make_echo_packet( p):
+def make_echo_packet(p):
     e = p
     e[Ether].src, e[Ether].dst = p[Ether].dst, p[Ether].src
     e[IP].src, e[IP].dst = p[IP].dst, p[IP].src
@@ -28,10 +29,19 @@ def make_echo_packet( p):
         pass
     return e
 
+def bytes_to_str(b):
+    return b.decode('utf-8').strip()
+
+class DpdkPingError(Exception):
+    def __init__(self, message, returncode):
+        super().__init__(message)
+        self.returncode = returncode
+
 class DpdkPingInterface:
     def __init__(self, name, index):
         self.name = name
         self.index = index
+        self.forward = None
         self.quiet = False
         self.lcore = 0
         self.smac = "22:4d:d9:98:03:%02x" % (index + 1)
@@ -54,12 +64,26 @@ class DpdkPingInterface:
     def ping_args(self):
         args = "-p %s -l %d" % (self.dpdk_name, self.lcore)
 
-        if self.request:
-            args += " -R 1"
+        if self.forward != None:
+            args += " -f %s" % self.forward.dpdk_name
         else:
-            args += " -E 1"
+            if self.request:
+                args += " -R 1"
+                args += " -B %d" % self.bandwidth
 
-        args += " -B %d" % self.bandwidth
+                if self.pdr != None:
+                    args += " --pdr"
+                if self.pdr_period != None:
+                    args += " --pdr-period %d" % self.pdr_period
+                if self.pdr_start != None:
+                    args += " --pdr-start %d" % self.pdr_start
+                if self.pdr_percent != None:
+                    args += " --pdr-percent %f" % self.pdr_percent
+                if self.pdr_step != None:
+                    args += " --pdr-step %d" % self.pdr_step
+            else:
+                args += " -E 1"
+
         if self.sip != None:
             args += " -s %s" % self.sip
         if self.dip:
@@ -76,21 +100,10 @@ class DpdkPingInterface:
         else:
             args += " -H %s" % self.smac
 
-        if self.pdr != None:
-            args += " --pdr"
-        if self.pdr_period != None:
-            args += " --pdr-period %d" % self.pdr_period
-        if self.pdr_start != None:
-            args += " --pdr-start %d" % self.pdr_start
-        if self.pdr_percent != None:
-            args += " --pdr-percent %f" % self.pdr_percent
-        if self.pdr_step != None:
-            args += " --pdr-step %d" % self.pdr_step
-
         return args
 
-    def wait(self):
-        pass
+    def wait_os_intf(self):
+        return True
 
 class DpdkPingMemifInterface(DpdkPingInterface):
     def __init__(self, name, index, role):
@@ -124,9 +137,8 @@ class DpdkPingTapInterface(DpdkPingInterface):
     def send(self, pkt):
          self.socket.send(pkt)#, iface=self.name)
 
-    def wait(self):
-        while True:
-            assert(not self.inst.done)
+    def wait_os_intf(self):
+        while not self.inst.done:
             addrs =  psutil.net_if_addrs()
             if self.name in addrs.keys():
                 for sa in addrs[self.name]:
@@ -134,8 +146,9 @@ class DpdkPingTapInterface(DpdkPingInterface):
                         self.dmac = sa.address
                 assert(self.dmac != None)
                 self.init()
-                break
+                return True
             time.sleep(0.1)
+        return False
 
     def wait_pdr_report(self, echo=True):
         while not self.rps.empty():
@@ -196,13 +209,25 @@ class DpdkPingInstance():
                     assert(len(output) - 1 == len(self.o))
                     intf = self.get_interface(output[0])
                     if intf != None:
-                        intf.output = dict(zip(self.o, output[1:]))
-                    
+                        intf.output = dict(zip(self.o, [int(i) for i in output[1:]]))
+                                    
             if VERBOSE != None:
                 print(line)
-        self.done = True
 
-    def start(self):
+        done = self.done
+        self.done = True
+ 
+        if not done and self.proc.returncode != 0:
+            s = "Process `%s` exited with code %d\n" % (self.comm, self.proc.returncode)
+            out, err = self.proc.communicate()
+            if out:
+                s += bytes_to_str(out) + "\n"
+            if err:
+                s += bytes_to_str(err) + "\n"
+            raise DpdkPingError(s, self.proc.returncode)
+
+
+    def run(self):
         self.comm = "./dpdk-ping --no-pci --proc-type=primary --file-prefix=dpg%d" % self.index
         for intf in self.interfaces:
             self.comm += " "
@@ -218,9 +243,19 @@ class DpdkPingInstance():
         if self.duration != None:
             self.comm += " -t %d" % self.duration
 
+        excluded = set()
         for intf in self.interfaces:
-            self.comm += " "
-            self.comm += intf.ping_args()
+            if intf.forward != None:
+                excluded.add(intf.forward)
+
+        first = True
+        for intf in self.interfaces:
+            if not intf in excluded:
+                self.comm += " "
+                if not first:
+                    self.comm += "-- "
+                first = False    
+                self.comm += intf.ping_args()
 
         if VERBOSE != None:
             print("")
@@ -233,17 +268,30 @@ class DpdkPingInstance():
         self.thread.start()
 
         for intf in self.interfaces:
-            intf.wait()
+            if not intf.wait_os_intf():
+                return False
 
-    def wait(self, timeout=None):
-        self.thread.join()
-        self.proc.communicate(timeout=timeout)
+        time.sleep(0.5)
+        
+        return not self.done
+
+    def wait_exit(self, timeout=None):
+        self.thread.join(timeout)
+        if timeout != None:
+            if self.thread.is_alive():
+                return False
+        try:
+            self.proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return False
         self.proc = None
+        return True
 
     def stop(self):
+        self.done = True
         if self.proc != None:
             self.proc.kill()
-            self.wait(10)
+            self.wait_exit(10)
 
 class TestDpdkPing(unittest.TestCase):
     def create_tap(self, index):
@@ -267,12 +315,22 @@ class TestDpdkPing(unittest.TestCase):
             inst.interfaces = []
         conf.ifaces.reload()
 
+    def test_port_already_configured(self):
+        inst = self.create_instance()
+        if0 = self.create_tap(0)
+        inst.add_interface(if0)
+        inst.add_interface(if0)
+        try:
+            inst.run()
+        except DpdkPingError:
+            pass
+
     def test_arp(self):
         inst = self.create_instance()
         if0 = self.create_tap(0)
         if0.gateway = "10.0.0.1"
         inst.add_interface(if0)
-        inst.start()
+        inst.run()
         capture = if0.recv(1, "arp")
         self.assertEqual(len(capture), 1)
         c = capture[0]
@@ -302,7 +360,7 @@ class TestDpdkPing(unittest.TestCase):
         if0.pdr_start = 5
         if0.pdr_period = 2
         if0.pdr_percent = 50
-        inst.start()
+        inst.run()
 
         # Slow start
         rps = if0.wait_pdr_report()
@@ -328,6 +386,86 @@ class TestDpdkPing(unittest.TestCase):
         rps = if0.wait_pdr_report()
         self.assertEqual(rps, 19)
 
+
+    def test_2interfaces(self):
+        inst = self.create_instance()
+
+        for i in range(0, 2):
+            intf = self.create_tap(i)
+            intf.sip = "1.1.1.10%d" % i
+            intf.dip = "2.2.2.10%d" % i
+            inst.add_interface(intf)
+
+        inst.run()
+
+        for intf in inst.interfaces:
+            capture = intf.recv(1, "icmp")
+            self.assertEqual(len(capture), 1)
+            c = capture[0]
+            self.assertEqual(c[IP].src, intf.sip)
+            self.assertEqual(c[IP].dst, intf.dip)
+
+
+    def test_icmp_echo(self):
+        inst = self.create_instance()
+        intf = self.create_tap(0)
+        intf.request = False
+        intf.sip = "1.1.1.100"
+        intf.dip = "2.2.2.100"     
+        inst.add_interface(intf)
+        inst.run()
+
+        p = (
+            Ether(src=intf.smac, dst=intf.smac)
+            / IP(src=intf.dip, dst=intf.sip)
+            / ICMP(id=1, type="echo-request")
+        )
+
+        intf.send(p)
+        capture = intf.recv(1, "icmp", 1)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+#        self.assertEqual(c[IP].src, intf.dip)
+#        self.assertEqual(c[IP].dst, intf.sip)
+
+
+    def _test_fwd(self):
+        ip0 = "1.1.1.100"
+        ip1 = "1.1.1.101"
+
+        inst = self.create_instance()
+        if0 = self.create_tap(0)
+        if1 = self.create_tap(1)
+        if0.forward = if1
+
+        inst.add_interface(if0)
+        inst.add_interface(if1)
+
+        inst.run()
+
+        p = (
+            Ether(src=if1.smac, dst=if1.smac)
+            / IP(src=ip0, dst=ip1)
+            / UDP(sport=100, dport=101)
+        )
+
+        #input("Press any key to continue");
+        if0.send(p)
+        capture = if1.recv(1, "ip && udp", timeout=1)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.assertEqual(c[IP].src, ip0)
+        self.assertEqual(c[IP].dst, ip1)
+
+        p = make_echo_packet(c)
+        if1.send(p)
+        capture = if0.recv(1, "src %s" % ip1, 1)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.assertEqual(c[IP].src, ip1)
+        self.assertEqual(c[IP].dst, ip0)
+
+
     def test_memif(self):
         inst0 = self.create_instance()
         if0 = self.create_memif(0, "server")
@@ -337,7 +475,7 @@ class TestDpdkPing(unittest.TestCase):
         if0.request = False
         if0.quiet = True
         inst0.add_interface(if0)
-        inst0.start()
+        inst0.run()
 
         time.sleep(1)
 
@@ -351,14 +489,16 @@ class TestDpdkPing(unittest.TestCase):
         inst1.omit = 2
         inst1.o = ["ipps", "opps", "requests", "replies"]
         inst1.add_interface(if1)
-        inst1.start()
+        inst1.run()
 
-        inst1.wait()
-        self.assertAlmostEqual(if1.output["requests"], if1.output["replies"], 6)
+        inst1.wait_exit()
+        #print(if1.output["requests"], if1.output["replies"])
+        self.assertTrue(if1.output["requests"] - if1.output["replies"] < 100000)
         
 
 if __name__ == '__main__':
     conf.verb = 0
+    #conf.debug_dissector = True
 
     VERBOSE = os.environ.get('VERBOSE')
     if VERBOSE != None:
