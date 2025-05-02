@@ -20,9 +20,6 @@
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_pci.h>
-#ifdef RTE_LIB_PDUMP
-#include <rte_pdump.h>
-#endif
 #include <rte_version.h>
 
 #define DPG_RX 0
@@ -3631,10 +3628,6 @@ main(int argc, char **argv)
 	argc -= rc;
 	argv += rc;
 
-#ifdef RTE_LIB_PDUMP
-	rte_pdump_init();
-#endif
-
 	g_dpg_hz = rte_get_tsc_hz();
 
 	for (i = 0; i < DPG_ARRAY_SIZE(g_dpg_lcores); ++i) {
@@ -3791,10 +3784,6 @@ main(int argc, char **argv)
 			rte_eal_wait_lcore(i);
 		}
 	}
-
-#ifdef RTE_LIB_PDUMP
-	rte_pdump_uninit();
-#endif
 
 	dpg_print_stat_banner();
 	DPG_FOREACH_PORT(port, port_id) {

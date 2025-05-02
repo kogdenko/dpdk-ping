@@ -1,25 +1,60 @@
 #!/bin/bash
 
+SCRIPT=$(basename $0)
+SCRIPTPATH=$(realpath "$0")
+SCRIPTDIR=$(dirname "$SCRIPTPATH")
+
 DPDK="/root/dpdk"
-DPDK_PING="/root/dpdk-ping"
-LOG="./build.log"
+LOG_DIR=""
+TAG="v18.05"
 
-#set -x
+usage()
+{
+	echo "$SCRIPT --dpdk {path} [-h] [--log {dir}] [--tag {tag}]"
+}
 
-cd $DPDK
+while [ $# -ge 1 ]; do
+	case "$1" in
+	-h)
+		usage
+		shift
+		exit 0
+		;;
+	--dpdk)
+		DPDK=$(realpath $2)
+		shift 2
+		;;
+	--log)
+		LOG_DIR=$(realpath $2)
+		shift 2
+		;;
+	--tag)
+		TAG=$2
+		shift 2
+		;;
+	* )
+		echo "$SCRIPT: unrecognized option '$1'"
+		exit 1
+	esac
+done
 
-if [ $# -eq 0 ]
-then
-	TAG="v18.05"
-else
-	TAG="$1"
+if [ -z "$DPDK" ]; then
+	usage
+	exit 2
 fi
 
-echo "" > $LOG
+cd $DPDK
 
 git tag | grep -A 5000 -m1 "^$TAG" | grep '^v[0-9][0-9]\.' | grep -v '\-rc' | while read tag
 do
 	cd $DPDK
+	
+	if [ -z "$LOG_DIR" ]; then
+		LOG="/dev/null"
+	else
+		mkdir -p $LOG_DIR
+		LOG=$LOG_DIR/$tag
+	fi
 
 	git stash save --keep-index --include-untracked >> $LOG 2>&1
 	git stash drop >> $LOG 2>&1
@@ -35,10 +70,10 @@ do
 		echo "$tag: DPDK compilation failed"
 	else
 		echo "$tag: DPDK compiled successfully"
-		cd $DPDK_PING
+		cd $SCRIPTDIR
 
-		make clean >> $LOG 2>&1 &&
-		make >> $LOG 2>&1
+		make clean >> /dev/null 2>&1
+		make build >> $LOG 2>&1
 		if [ $? -ne 0 ]; then
 			echo "$tag: dpdk-ping compilation failed"
 		else

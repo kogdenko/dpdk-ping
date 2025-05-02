@@ -16,6 +16,7 @@ from datetime import datetime
 from scapy.all import *
 
 VERBOSE = None
+BUILDDIR = None
 
 def make_echo_packet(p):
     e = p
@@ -225,7 +226,8 @@ class DpdkPingInstance():
 
 
     def run(self):
-        self.comm = "./dpdk-ping --no-pci --proc-type=primary --file-prefix=dpg%d" % self.index
+        exe = os.path.abspath(BUILDDIR) + "/dpdk-ping"
+        self.comm = "%s --no-pci --proc-type=primary --file-prefix=dpg%d" % (exe, self.index)
         for intf in self.interfaces:
             self.comm += " "
             self.comm += intf.dpdk_args()
@@ -494,6 +496,9 @@ if __name__ == '__main__':
     VERBOSE = os.environ.get('VERBOSE')
     if VERBOSE != None:
         VERBOSE = int(VERBOSE)
+    BUILDDIR = os.environ.get("BUILDDIR")
+    if BUILDDIR == None:
+        BUILDDIR = "./build"
 
     try:
         unittest.main()
