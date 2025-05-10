@@ -9,5 +9,10 @@ ldflags = ldflags_cmd.stdout().split()
 
 ldflags += ['-lm', '-lpthread']
 
-sources = files('main.c')
+sources = files('main.c', 'dpdk.c')
 executable('dpdk-ping', sources, c_args: cflags, link_args: ldflags)
+
+ldflags += ['-lpcap']
+
+sources = files('dpdk-pcapreply.c', 'dpdk.c')
+executable('dpdk-pcapreply', sources, c_args: cflags, link_args: ldflags)

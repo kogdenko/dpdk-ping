@@ -13,14 +13,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <rte_bus.h>
-#include <rte_common.h>
-#include <rte_cycles.h>
-#include <rte_eal.h>
-#include <rte_ethdev.h>
-#include <rte_mbuf.h>
-#include <rte_pci.h>
-#include <rte_version.h>
+#include "dpdk.h"
 
 #define DPG_RX 0
 #define DPG_TX 1
@@ -66,64 +59,8 @@
 #define DPG_ETHER_TYPE_IPV4 0x0800
 #define DPG_ARP_HRD_ETHER 1
 
-#define DPG_MEMPOOL_CACHE_SIZE 128
 #define DPG_MAX_PKT_BURST 128
 #define DPG_TXBUF_SIZE DPG_MAX_PKT_BURST
-
-#define DPG_PPSTR(x) DPG_PPXSTR(x)
-#define DPG_PPXSTR(x) #x
-
-#define DPG_PACKED  __attribute__((packed)) __attribute__((aligned(2)))
-
-#pragma message "DPDK: "\
-		DPG_PPSTR(RTE_VER_YEAR)"." \
-		DPG_PPSTR(RTE_VER_MONTH)"." \
-		DPG_PPSTR(RTE_VER_MINOR)"." \
-		DPG_PPSTR(RTE_VER_RELEASE)
-
-#if RTE_VERSION < RTE_VERSION_NUM(18, 5, 0, 16)
-#error "Too old DPDK version (not tested)"
-#endif
-
-#if RTE_VERSION <= RTE_VERSION_NUM(21, 8, 0, 99) 
-#define DPG_ETH_MQ_TX_NONE ETH_MQ_TX_NONE
-#define DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE DEV_TX_OFFLOAD_MBUF_FAST_FREE
-#define DPG_ETH_MQ_RX_RSS ETH_MQ_RX_RSS
-#define DPG_ETH_RSS_IP ETH_RSS_IP
-#define DPG_ETH_RSS_TCP ETH_RSS_TCP
-#define DPG_ETH_RSS_UDP ETH_RSS_UDP
-#else
-// 21.11.0.99
-#define DPG_ETH_MQ_TX_NONE RTE_ETH_MQ_TX_NONE
-#define DPG_ETH_TX_OFFLOAD_MBUF_FAST_FREE RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE
-#define DPG_ETH_MQ_RX_RSS RTE_ETH_MQ_RX_RSS
-#define DPG_ETH_RSS_IP RTE_ETH_RSS_IP
-#define DPG_ETH_RSS_TCP RTE_ETH_RSS_TCP
-#define DPG_ETH_RSS_UDP RTE_ETH_RSS_UDP
-#endif
-
-#if RTE_VERSION <= RTE_VERSION_NUM(19, 5, 0, 99)
-typedef struct ether_addr dpg_eth_addr_t;
-#define dpg_eth_format_addr ether_format_addr
-#else
-// 19, 8, 0, 99
-typedef struct rte_ether_addr dpg_eth_addr_t;
-#define dpg_eth_format_addr rte_ether_format_addr
-#endif
-
-#if RTE_VERSION <= RTE_VERSION_NUM(22, 7, 0, 99)
-#define dpg_dev_name(dev) ((dev)->name)
-#else
-// 22.11.0.99
-#define dpg_dev_name(dev) rte_dev_name(dev)
-#endif
-
-#define dpg_ntoh16 rte_be_to_cpu_16
-#define dpg_hton16 rte_cpu_to_be_16
-#define dpg_ntoh32 rte_be_to_cpu_32
-#define dpg_hton32 rte_cpu_to_be_32
-#define dpg_ntoh64 rte_cpu_to_be_64
-#define dpg_hton64 rte_be_to_cpu_64
 
 #define DPG_TCP_FIN 0x01
 #define DPG_TCP_SYN 0x02
@@ -392,7 +329,7 @@ struct dpg_port {
 	volatile uint8_t arp_resolved;
 
 	uint16_t pkt_len;
-	uint8_t proto;
+	uint8_t pt_proto;
 
 	struct dpg_container addresses4;
 	struct dpg_container addresses6;
@@ -477,7 +414,6 @@ static volatile int g_dpg_done;
 static uint64_t g_dpg_hz;
 static struct dpg_port *g_dpg_ports[RTE_MAX_ETHPORTS];
 static struct dpg_lcore g_dpg_lcores[RTE_MAX_LCORE];
-static struct rte_mempool *g_dpg_pktmbuf_pool;
 static int g_dpg_verbose[2];
 static int g_dpg_bflag;
 static int g_dpg_elapsed = 0;
@@ -514,9 +450,6 @@ static const char *g_dpg_oselector_strings[DPG_OSELECTOR_COUNT] = {
 #define dpg_container_of(ptr, type, field) \
 	((type *)((intptr_t)(ptr) - dpg_field_off(type, field)))
 
-#define dpg_die(...) \
-	rte_exit(EXIT_FAILURE, ##__VA_ARGS__);
-
 #define DPG_READ_ONCE(x) \
 ({ \
 	union { \
@@ -538,13 +471,6 @@ static const char *g_dpg_oselector_strings[DPG_OSELECTOR_COUNT] = {
 	dpg_write_once(&(x), u.data, sizeof(x)); \
 	u.val; \
 })
-
-#define dpg_dbg(f, ...) do { \
-	printf("%u: ", __LINE__); \
-	printf(f, ##__VA_ARGS__); \
-	printf("\n"); \
-	fflush(stdout); \
-} while (0)
 
 static dpg_uint128_t dpg_container_get(struct dpg_container *ct, dpg_uint128_t i);
 
@@ -649,29 +575,6 @@ dpg_xrealloc(void *ptr, size_t size)
 		dpg_die("realloc(%zu) failed\n", size);
 	}
 	return cp;
-}
-
-static struct rte_mbuf *
-dpg_pktmbuf_alloc(void)
-{
-	struct rte_mbuf *m;
-
-	m = rte_pktmbuf_alloc(g_dpg_pktmbuf_pool);
-	if (m == NULL) {
-		dpg_die("rte_pktmbuf_alloc() failed\n");
-	}
-	return m;
-}
-
-static const char *
-dpg_get_port_name(uint16_t port_id)
-{
-	static char port_name[RTE_MAX_ETHPORTS][RTE_ETH_NAME_MAX_LEN];
-
-	if (port_name[port_id][0] == '\0') {
-		rte_eth_dev_get_name_by_port(port_id, port_name[port_id]);
-	}
-	return port_name[port_id];
 }
 
 static bool
@@ -1360,23 +1263,6 @@ dpg_eth_macaddr_get(uint16_t port_id, dpg_eth_addr_t *mac_addr)
 }
 
 static void
-dpg_eth_dev_info_get(uint16_t port_id, struct rte_eth_dev_info *dev_info)
-{
-#if RTE_VERSION <= RTE_VERSION_NUM(19, 8, 0, 99)
-	rte_eth_dev_info_get(port_id, dev_info);
-#else
-	// 19.11.0.99
-	int rc;
-
-	rc = rte_eth_dev_info_get(port_id, dev_info);
-	if (rc < 0) {
-		dpg_die("rte_eth_dev_info_get('%s') failed (%d:%s)\n",
-				dpg_get_port_name(port_id), -rc, rte_strerror(-rc));
-	}
-#endif
-}
-
-static void
 dpg_invalid_argument(int short_name, const char *long_name)
 {
 	if (long_name != NULL) {
@@ -1837,7 +1723,7 @@ dpg_create_port(void)
 	port->pt_fwd_id = RTE_MAX_ETHPORTS;
 	port->rps_max = DPG_DEFAULT_RPS;
 	port->pkt_len = DPG_DEFAULT_PKT_LEN;
-	port->proto = IPPROTO_ICMP;
+	port->pt_proto = IPPROTO_ICMP;
 
 	port->pdr_percent = DPG_DEFAULT_PDR_PERCENT;
 	port->pdr_period = DPG_DEFAULT_PDR_PERIOD;
@@ -2125,11 +2011,11 @@ dpg_parse_port(int argc, char **argv)
 				}
 				g_dpg_human_readable = rc;
 			} else if (!strcmp(optname, "udp")) {
-				port->proto = IPPROTO_UDP;
+				port->pt_proto = IPPROTO_UDP;
 			} else if (!strcmp(optname, "tcp")) {
-				port->proto = IPPROTO_TCP;
+				port->pt_proto = IPPROTO_TCP;
 			} else if (!strcmp(optname, "icmp")) {
-				port->proto = IPPROTO_ICMP;
+				port->pt_proto = IPPROTO_ICMP;
 			} else if (!strcmp(optname, "icmp-id")) {
 				ct = port->session_field + DPG_SESSION_ICMP_ID;
 				rc = dpg_container_parse_u16(optarg, ct);
@@ -2434,7 +2320,7 @@ dpg_parse_port(int argc, char **argv)
 			}
 		}
 
-		if (port->proto == IPPROTO_ICMP) {
+		if (port->pt_proto == IPPROTO_ICMP) {
 			dpg_del_session_field(port, DPG_SESSION_SRC_PORT);
 			dpg_del_session_field(port, DPG_SESSION_DST_PORT);
 		} else {
@@ -2570,7 +2456,7 @@ dpg_create_request(struct dpg_task *task)
 	eh = rte_pktmbuf_mtod(m, struct dpg_eth_hdr *);
 
 	m->pkt_len = sizeof(*eh) + sizeof(*ih);
-	switch (port->proto) {
+	switch (port->pt_proto) {
 	case IPPROTO_ICMP:
 		m->pkt_len += sizeof(*ich);
 		break;
@@ -2638,7 +2524,7 @@ dpg_create_request(struct dpg_task *task)
 	ih->packet_id = 0;
 	ih->fragment_offset = 0;
 	ih->time_to_live = 64;
-	ih->next_proto_id = port->proto;
+	ih->next_proto_id = port->pt_proto;
 	ih->hdr_checksum = 0;
 
 	field = task->session_field + DPG_SESSION_SRC_IP;
@@ -2651,7 +2537,7 @@ dpg_create_request(struct dpg_task *task)
 
 	ih->hdr_checksum = dpg_cksum(ih, sizeof(*ih));
 
-	switch (port->proto) {
+	switch (port->pt_proto) {
 	case IPPROTO_ICMP:
 		ich = (struct dpg_icmp_hdr *)(ih + 1);
 		ich->icmp_type = DPG_IP_ICMP_ECHO_REQUEST;
