@@ -23,7 +23,7 @@ build-$BT:
 	ninja --verbose -C $BT
 
 .PHONY: test-$BT
-test-$BT: $BT
+test-$BT: build-$BT
 	BUILDDIR=$BT FAILFAST=\$(FAILFAST) ./test.py -v -k=\$(TEST)
 EOF
 done

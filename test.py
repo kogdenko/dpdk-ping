@@ -200,6 +200,9 @@ class dpdk_app():
     def process_output(self, line):
         pass
 
+    def reset(self):
+        pass
+
     def monitor(self):
         while self.proc.poll() is None:
             line = self.proc.stdout.readline().decode("utf-8").strip("\n")
@@ -213,17 +216,17 @@ class dpdk_app():
 
         out, err = self.proc.communicate()
         self.returncode = self.proc.returncode
+        if self.returncode == -11:
+            print("Process `%s` segfault\n" % self.comm)
         self.proc = None
-#            if out:
-#                s += bytes_to_str(out) + "\n"
-#            if err:
-#                s += bytes_to_str(err) + "\n"
-#            raise DpdkPingError(s, self.proc.returncode)
+        self.reset()
 
     def args(self):
         return ""
 
     def run(self):
+        assert(self.proc == None)
+
         cores = []
         for intf in self.interfaces:
             if not intf.core in cores:
@@ -255,7 +258,8 @@ class dpdk_app():
             if not intf.wait_os_intf():
                 return False
 
-        time.sleep(0.5)
+        # FIXME: Wait memif interface
+        time.sleep(1)
 
     def wait(self, timeout=None):
         self.thread.join(timeout)
@@ -277,6 +281,9 @@ class dpdk_ping(dpdk_app):
         self.duration = None
         self.omit = None
         self.o = []
+        self.state_stat = False
+
+    def reset(self):
         self.state_stat = False
 
     def process_output(self, line):
@@ -612,25 +619,23 @@ class TestDpdkPing(unittest.TestCase):
         self.assertEqual(c[IP].src, ip1)
         self.assertEqual(c[IP].dst, ip0)
 
-    def echo_bandwidth(self, if0, if1, ping, pong):
-        if0.sip = None
-        if0.dip = None
-        if0.request = False
-        if0.quiet = True
-        pong.add_interface(if0)
+    def echo_bandwidth(self, pong_if, ping_if, ping, pong, duration=12, bandwidth=100000000):
+        pong_if.sip = None
+        pong_if.dip = None
+        pong_if.request = False
+        pong_if.quiet = True
         pong.run()
 
-        if1.sip = None
-        if1.dip = None
-        if1.bandwidth = 100000000
-        ping.duration = 12
+        ping_if.sip = None
+        ping_if.dip = None
+        ping.duration = duration
+        ping_if.bandwidth = bandwidth
         ping.omit = 2
         ping.o = ["ipps", "opps", "requests", "replies"]
-        ping.add_interface(if1)
         ping.run()
 
         ping.wait()
-        #print(if1.output["requests"], if1.output["replies"])
+        pong.kill()
 
     # dpdk-ping --> dpdk-ping
     def test_002_memif(self):
@@ -643,8 +648,22 @@ class TestDpdkPing(unittest.TestCase):
         if1 = memif[1]
         if0.core = CORES[0]
         if1.core = CORES[1]
+        ping.add_interface(if1)
+        pong.add_interface(if0)
+
+#        self.echo_bandwidth(if0, if1, ping, pong, 5, 1)
+#        requests = if1.output["requests"]
+#        replies = if1.output["replies"]
+#        self.assertGreaterEqual(requests, 4)
+#        self.assertGreaterEqual(replies, 4)
+
+        # Benchmark
         self.echo_bandwidth(if0, if1, ping, pong)
-        self.assertTrue(if1.output["requests"] - if1.output["replies"] < 100000)
+
+        requests = if1.output["requests"]
+        replies = if1.output["replies"]
+        self.assertTrue(requests > 100000)
+        self.assertTrue(requests - replies < 100000)
         print("throughput_pps", __name__, if1.output["opps"])
 
     # dpdk-ping --> dpdk-testpmd --> dpdk-ping
@@ -667,6 +686,8 @@ class TestDpdkPing(unittest.TestCase):
         testpmd.add_interface(memif1[0])
         testpmd.run()
 
+        ping.add_interface(if1)
+        pong.add_interface(if0)
         self.echo_bandwidth(if0, if1, ping, pong)
 
 if __name__ == '__main__':
