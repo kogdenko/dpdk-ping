@@ -2768,7 +2768,7 @@ dpg_create_neighbour_advertisment(struct dpg_port *port, struct rte_mbuf *m,
 	uint8_t target[DPG_IPV6_ADDR_SIZE];
 	struct dpg_icmpv6_neigh_advertisment *na;
 	struct dpg_target_link_layer_address_option *opt;
-	struct dpg_ipv6_pseudo_hdr pseudo;
+	struct dpg_ipv6_pseudo_hdr pseudo6;
 
 	len = sizeof(*na) + sizeof(*opt);
 	m->pkt_len = m->data_len = sizeof(struct dpg_eth_hdr) + sizeof(*ih) + len;
@@ -2793,12 +2793,13 @@ dpg_create_neighbour_advertisment(struct dpg_port *port, struct rte_mbuf *m,
 	opt->length = sizeof(*opt) / 8;
 	opt->address = port->src_eth_addr;
 
-	memcpy(pseudo.src_addr, ih->src_addr, sizeof(pseudo.src_addr));
-	memcpy(pseudo.dst_addr, ih->dst_addr, sizeof(pseudo.dst_addr));
-	pseudo.proto = (uint32_t)(DPG_IPPROTO_ICMPV6 << 24);
-	pseudo.len = rte_cpu_to_be_32(len);
+	memset(&pseudo6, 0, sizeof(pseudo6));
+	memcpy(pseudo6.src_addr, ih->src_addr, sizeof(pseudo6.src_addr));
+	memcpy(pseudo6.dst_addr, ih->dst_addr, sizeof(pseudo6.dst_addr));
+	pseudo6.proto = (uint32_t)(DPG_IPPROTO_ICMPV6 << 24);
+	pseudo6.len = rte_cpu_to_be_32(len);
 
-	sum = dpg_cksum_raw(&pseudo, sizeof(pseudo));
+	sum = dpg_cksum_raw(&pseudo6, sizeof(pseudo6));
 	sum = dpg_cksum_add(sum, dpg_cksum_raw(na, sizeof(*na)));
 	sum = dpg_cksum_add(sum, dpg_cksum_raw(opt, sizeof(*opt)));
 
@@ -3036,9 +3037,6 @@ dpg_do_ping(struct dpg_port *port, struct dpg_task *task)
 		rc = dpg_process_packet(task, m);
 		if (rc == 0) {
 			dpg_set_eth_hdr_addresses(port, m);
-			rte_pktmbuf_free(m);
-
-			m = dpg_create_request(task);
 
 			if (!dpg_tx_queue_full(&task->rpl_queue)) {
 				dpg_tx_queue_add(&task->rpl_queue, m);

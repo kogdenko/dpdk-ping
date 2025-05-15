@@ -35,12 +35,7 @@ def make_echo_packet(p):
 def bytes_to_str(b):
     return b.decode('utf-8').strip()
 
-class DpdkPingError(Exception):
-    def __init__(self, message, returncode):
-        super().__init__(message)
-        self.returncode = returncode
-
-class DpdkPingInterface:
+class dpdk_ping_interface:
     def __init__(self, name, index):
         self.name = name
         self.index = index
@@ -108,7 +103,7 @@ class DpdkPingInterface:
     def wait_os_intf(self):
         return True
 
-class DpdkPingMemifInterface(DpdkPingInterface):
+class dpdk_ping_memif_interface(dpdk_ping_interface):
     def __init__(self, name, index, role):
         super().__init__(name, index)
         smac = "22:4d:d9:99:%02x:01" % (index + 1)
@@ -132,7 +127,18 @@ class DpdkPingMemifInterface(DpdkPingInterface):
         return ("--vdev=%s,role=%s,socket=%s,socket-abstract=no" %
             (self.name, self.role, path))
 
-class DpdkPingTapInterface(DpdkPingInterface):
+class dpdk_ping_pg_interface(dpdk_ping_interface):
+    def __init__(self, testcase, name, index):
+        super().__init__(name, index)
+        self.memif = testcase.create_memif_pair()
+        self.smac = self.memif[0].smac
+        self.dmac = self.memif[0].dmac
+        self.dpdk_name = self.memif[0].dpdk_name
+
+    def dpdk_args(self):
+        return self.memif[0].dpdk_args()
+
+class dpdk_ping_tap_interface(dpdk_ping_interface):
     def __init__(self, name, index):
         super().__init__(name, index)
         self.dpdk_name = "net_tap%d" % index
@@ -340,7 +346,9 @@ class dpdk_pcapreply(dpdk_app):
         self.rpath = None
 
     def args(self):
-        s = "-t %d -n %d -w %s" % (self.timeout, self.n_packets, self.wpath)
+        s = "-t %d -w %s" % (self.timeout, self.wpath)
+        if self.n_packets != None:
+            s += " -n %d" % self.n_packets
         if self.rpath != None:
             s += " -r %s" % self.rpath
         return s
@@ -361,14 +369,6 @@ class dpdk_pcapreply(dpdk_app):
         return rdpcap(self.wpath)
 
 class TestDpdkPing(unittest.TestCase):
-    def create_tap(self, index):
-        return DpdkPingTapInterface("dpg%d" % index, index)
-
-    def create_memif(self, index):
-        return [
-            DpdkPingMemifInterface("net_memif%d" % index, index, "server"),
-            DpdkPingMemifInterface("net_memif%d" % index, index, "client")]
-
     def create_instance(self, classname):
         index = len(self.instances)
         inst = classname(index)
@@ -385,8 +385,27 @@ class TestDpdkPing(unittest.TestCase):
     def create_dpdk_pcapreply(self):
         return self.create_instance(dpdk_pcapreply)
 
+    def create_tap_interface(self):
+        index = self.interface_index
+        self.interface_index += 1
+        return dpdk_ping_tap_interface("dpg%d" % index, index)
+
+    def create_memif_pair(self):
+        index = self.interface_index
+        self.interface_index += 1
+        return [
+            dpdk_ping_memif_interface("net_memif%d" % index, index, "server"),
+            dpdk_ping_memif_interface("net_memif%d" % index, index, "client")]
+
+    def create_pg_interface(self):
+        index = self.interface_index
+        self.interface_index += 1
+        name = "pg%d" % index
+        return dpdk_ping_pg_interface(self, name, index)
+
     def setUp(self):
         self.testpath = BUILDPATH + "/test/" + self._testMethodName
+        self.interface_index = 0
         os.mkdir(self.testpath)
         self.instances = []
 
@@ -396,18 +415,27 @@ class TestDpdkPing(unittest.TestCase):
             inst.interfaces = []
         conf.ifaces.reload()
 
+    def send_and_expect(self, iif, in_packets, n_out_packets, oif, timeout=1000):
+        pcapreply = self.create_dpdk_pcapreply()
+        self.assertTrue(type(iif) is dpdk_ping_pg_interface)
+        self.assertTrue(type(oif) is dpdk_ping_pg_interface)
+        pcapreply.add_interface(iif.memif[1])
+        if oif != iif:
+            pcapreply.add_interface(oif.memif[1])
+        return pcapreply.send_and_expect(in_packets, n_out_packets)
+
     def assert_cores(self, n):
         if len(CORES) < n:
             self.skipTest("not enough cores: %d cores are required, but %d are available" %
                 (n, len(CORES)))
 
-    def test_001_pcap(self):
+    def test_000_pcap(self):
         self.assert_cores(2)
 
         testpmd = self.create_dpdk_testpmd()
         pcapreply = self.create_dpdk_pcapreply()
-        memif0 = self.create_memif(0)
-        memif1 = self.create_memif(1)
+        memif0 = self.create_memif_pair()
+        memif1 = self.create_memif_pair()
 
         memif0[0].core = CORES[0]
         memif1[0].core = CORES[1]
@@ -435,9 +463,9 @@ class TestDpdkPing(unittest.TestCase):
         self.assertEqual(c[IP].dst, p[IP].dst)
         self.assertEqual(c[IP].len, p[IP].len)
 
-    def test_port_already_configured(self):
+    def test_port_duplicate(self):
         inst = self.create_dpdk_ping()
-        if0 = self.create_tap(0)
+        if0 = self.create_tap_interface()
         inst.add_interface(if0)
         inst.add_interface(if0)
 
@@ -447,7 +475,7 @@ class TestDpdkPing(unittest.TestCase):
 
     def test_arp(self):
         inst = self.create_dpdk_ping()
-        if0 = self.create_tap(0)
+        if0 = self.create_tap_interface()
         if0.gateway = "10.0.0.1"
         inst.add_interface(if0)
         inst.run()
@@ -474,7 +502,7 @@ class TestDpdkPing(unittest.TestCase):
 
     def test_pdr(self):
         inst = self.create_dpdk_ping()
-        if0 = self.create_tap(0)
+        if0 = self.create_tap_interface()
         inst.add_interface(if0)
         if0.bandwidth = 1000
         if0.pdr_start = 5
@@ -506,12 +534,11 @@ class TestDpdkPing(unittest.TestCase):
         rps = if0.wait_pdr_report()
         self.assertEqual(rps, 19)
 
-
     def test_2interfaces(self):
         inst = self.create_dpdk_ping()
 
         for i in range(0, 2):
-            intf = self.create_tap(i)
+            intf = self.create_tap_interface()
             intf.sip = "1.1.1.10%d" % i
             intf.dip = "2.2.2.10%d" % i
             inst.add_interface(intf)
@@ -525,37 +552,37 @@ class TestDpdkPing(unittest.TestCase):
             self.assertEqual(c[IP].src, intf.sip)
             self.assertEqual(c[IP].dst, intf.dip)
 
-
-    def _test_icmp_echo(self):
+    def test_001_icmp_echo(self):
         inst = self.create_dpdk_ping()
-        intf = self.create_tap(0)
-        intf.request = False
-        intf.sip = "1.1.1.100"
-        intf.dip = "2.2.2.100"     
-        inst.add_interface(intf)
+        iif = self.create_pg_interface()
+        iif.request = False
+        iif.sip = "1.1.1.100"
+        iif.dip = "2.2.2.100"     
+        inst.add_interface(iif)
         inst.run()
 
         p = (
-            Ether(src=intf.smac, dst=intf.smac)
-            / IP(src=intf.dip, dst=intf.sip)
-            / ICMP(id=1, type="echo-request")
+            Ether(src=iif.smac, dst=iif.smac)
+            / IP(src=iif.dip, dst=iif.sip)
+            / ICMP(id=333, seq=444, type="echo-request")
         )
 
-        intf.send(p)
-        capture = intf.recv(1, "icmp", 1)
+        capture = self.send_and_expect(iif, p, 1, iif)
         self.assertEqual(len(capture), 1)
         c = capture[0]
-#        self.assertEqual(c[IP].src, intf.dip)
-#        self.assertEqual(c[IP].dst, intf.sip)
-
+        self.assertEqual(c[IP].src, iif.sip)
+        self.assertEqual(c[IP].dst, iif.dip)
+        self.assertEqual(c[ICMP].id, p[ICMP].id)
+        self.assertEqual(c[ICMP].seq, p[ICMP].seq)
+        self.assertEqual(c[ICMP].type, ICMP(type="echo-reply").type)
 
     def _test_fwd(self):
         ip0 = "1.1.1.100"
         ip1 = "1.1.1.101"
 
         inst = self.create_dpdk_ping()
-        if0 = self.create_tap(0)
-        if1 = self.create_tap(1)
+        if0 = self.create_tap_interface()
+        if1 = self.create_tap_interface()
         if0.forward = if1
 
         inst.add_interface(if0)
@@ -595,7 +622,7 @@ class TestDpdkPing(unittest.TestCase):
 
         if1.sip = None
         if1.dip = None
-        if1.bandwidth = 10000000
+        if1.bandwidth = 100000000
         ping.duration = 12
         ping.omit = 2
         ping.o = ["ipps", "opps", "requests", "replies"]
@@ -611,13 +638,14 @@ class TestDpdkPing(unittest.TestCase):
        
         ping = self.create_dpdk_ping()
         pong = self.create_dpdk_ping()
-        memif = self.create_memif(0)
+        memif = self.create_memif_pair()
         if0 = memif[0]
         if1 = memif[1]
         if0.core = CORES[0]
         if1.core = CORES[1]
         self.echo_bandwidth(if0, if1, ping, pong)
         self.assertTrue(if1.output["requests"] - if1.output["replies"] < 100000)
+        print("throughput_pps", __name__, if1.output["opps"])
 
     # dpdk-ping --> dpdk-testpmd --> dpdk-ping
     def test_003_memif(self):
@@ -626,8 +654,8 @@ class TestDpdkPing(unittest.TestCase):
         ping = self.create_dpdk_ping()
         pong = self.create_dpdk_ping()
         testpmd = self.create_dpdk_testpmd()
-        memif0 = self.create_memif(0)
-        memif1 = self.create_memif(1)
+        memif0 = self.create_memif_pair()
+        memif1 = self.create_memif_pair()
         if0 = memif0[1]
         if1 = memif1[1]
         if0.core = CORES[2]
@@ -666,8 +694,12 @@ if __name__ == '__main__':
         pass
     os.mkdir(testpath)
 
+    failfast = os.environ.get("FAILFAST")
+    if failfast != None:
+        failfast = int(failfast) > 0
+
     try:
-        unittest.main()
+        unittest.main(failfast=failfast)
     except KeyboardInterrupt:
         pass
 

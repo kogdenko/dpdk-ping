@@ -110,7 +110,7 @@ dpg_loop(void *dummy)
 				m = burst[0];
 				gettimeofday(&out_pkt_hdr.ts, NULL);
 				out_pkt_hdr.len = out_pkt_hdr.caplen = m->pkt_len;
-				dpg_dbg("dpdk->pcap: %d", m->pkt_len);
+				//dpg_dbg("dpdk->pcap: %d", m->pkt_len);
 				pkt_dat = rte_pktmbuf_mtod(m, void *);
 				pcap_dump((u_char *)g_dpg_dump, &out_pkt_hdr, pkt_dat);
 				n_packets++;
@@ -126,7 +126,7 @@ dpg_loop(void *dummy)
 			if (rc == 1) {
 				m = dpg_pktmbuf_alloc();
 				m->pkt_len = m->data_len = in_pkt_hdr->len;
-				dpg_dbg("pcap->dpdk: %u %u", in_pkt_hdr->len, in_pkt_hdr->caplen);
+				//dpg_dbg("pcap->dpdk: %u %u", in_pkt_hdr->len, in_pkt_hdr->caplen);
 				memcpy(rte_pktmbuf_mtod(m, void *), pkt_dat, m->pkt_len);
 				burst[0] = m;
 				do {

@@ -15,15 +15,15 @@ cat << EOF >> $MAKEFILE
 clean-$BT:
 	rm -rf $BT
 
-.PHONY: $BT
-$BT:
+.PHONY: build-$BT
+build-$BT:
 	if [ ! -d "$BT" ]; then \\
-		meson setup --buildtype $BT $BT; \\
+		CC=clang meson setup --buildtype $BT $BT; \\
 	fi
 	ninja --verbose -C $BT
 
 .PHONY: test-$BT
 test-$BT: $BT
-	BUILDDIR=$BT ./test.py -v -k=\$(TEST)
+	BUILDDIR=$BT FAILFAST=\$(FAILFAST) ./test.py -v -k=\$(TEST)
 EOF
 done
