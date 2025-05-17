@@ -288,7 +288,9 @@ enum dpg_session_field {
 
 struct dpg_ring {
 	uint32_t r_head;
-	int r_size;
+	uint32_t r_tail;
+	uint32_t r_size;
+	uint32_t r_mask;
 	void **r_data;
 };
 
@@ -1632,47 +1634,60 @@ static void
 dpg_ring_init(struct dpg_ring *r, int size)
 {
 	r->r_size = size;
+	r->r_mask = size - 1;
 	r->r_data = dpg_xmalloc(size * sizeof(void *));
-	r->r_head = 0;
+	r->r_head = r->r_tail = 0;
 }
 
-static bool
+static int
+dpg_ring_size(struct dpg_ring *r)
+{
+	return r->r_head - r->r_tail;
+}
+
+static int
 dpg_ring_is_full(struct dpg_ring *r)
 {
-	return r->r_head == r->r_size;
+	return dpg_ring_size(r) == r->r_size;
 }
 
 static bool
 dpg_ring_is_empty(struct dpg_ring *r)
 {
-	return r->r_head == 0;
+	return dpg_ring_size(r) == 0;
 }
 
 static int
 dpg_ring_room(struct dpg_ring *r)
 {
-	return r->r_size - r->r_head;
+	return r->r_size - dpg_ring_size(r);
 }
 
 static void
 dpg_ring_push(struct dpg_ring *r, struct rte_mbuf *m)
 {
 	assert(!dpg_ring_is_full(r));
-	r->r_data[r->r_head++] = m;
+	r->r_data[r->r_head & r->r_mask] = m;
+	r->r_head++;
 }
 
 static int
 dpg_ring_tx(struct dpg_ring *r, int port_id, int queue_id)
 {
-	int txed, n, m;
+	int txed, size, tail, n, m;
 
 	txed = 0;
-	while (r->r_head) {
-		n = DPG_MIN(DPG_MAX_PKT_BURST, r->r_head);
-		m = rte_eth_tx_burst(port_id, queue_id, (struct rte_mbuf **)r->r_data, r->r_head);
-		memmove(r->r_data, r->r_data + txed, (r->r_head - m) * sizeof(void *));
+	while (1) {
+		size = dpg_ring_size(r);
+		if (!size) {
+			break;
+		}
+		tail = r->r_tail & r->r_mask;
+		size = DPG_MIN(size, r->r_size - tail);
+		n = DPG_MIN(DPG_MAX_PKT_BURST, size);
+		m = rte_eth_tx_burst(port_id, queue_id, (struct rte_mbuf **)(r->r_data + tail), n);
 		txed += m;
-		r->r_head -= m;
+		r->r_tail += m;
 		if (m < n) {
 			break;
 		}
