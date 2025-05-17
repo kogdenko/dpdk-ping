@@ -286,10 +286,10 @@ enum dpg_session_field {
 	DPG_SESSION_FIELD_MAX,
 };
 
-struct dpg_tx_queue {
-	int bytes;
-	int n_pkts;
-	struct rte_mbuf *pkts[DPG_MAX_PKT_BURST];
+struct dpg_ring {
+	uint32_t r_head;
+	int r_size;
+	void **r_data;
 };
 
 struct dpg_task {
@@ -314,8 +314,8 @@ struct dpg_task {
 
 	struct dpg_dlist session_field_head;
 
-	struct dpg_tx_queue t_reqq;
-	struct dpg_tx_queue t_rplq;
+	struct dpg_ring t_reqq;
+	struct dpg_ring t_rplq;
 };
 
 struct dpg_port {
@@ -1628,41 +1628,54 @@ dpg_container_parse_ipv6(char *str, struct dpg_container *c)
 	return rc;
 }
 
-static bool
-dpg_tx_queue_full(struct dpg_tx_queue *q)
+static void
+dpg_ring_init(struct dpg_ring *r, int size)
 {
-	return q->n_pkts == DPG_ARRAY_SIZE(q->pkts);
+	r->r_size = size;
+	r->r_data = dpg_xmalloc(size * sizeof(void *));
+	r->r_head = 0;
 }
 
 static bool
-dpg_tx_queue_empty(struct dpg_tx_queue *q)
+dpg_ring_is_full(struct dpg_ring *r)
 {
-	return q->n_pkts == 0;
+	return r->r_head == r->r_size;
+}
+
+static bool
+dpg_ring_is_empty(struct dpg_ring *r)
+{
+	return r->r_head == 0;
 }
 
 static int
-dpg_tx_queue_room(struct dpg_tx_queue *q)
+dpg_ring_room(struct dpg_ring *r)
 {
-	return DPG_ARRAY_SIZE(q->pkts) - q->n_pkts;
+	return r->r_size - r->r_head;
 }
 
 static void
-dpg_tx_queue_add(struct dpg_tx_queue *q, struct rte_mbuf *m)
+dpg_ring_push(struct dpg_ring *r, struct rte_mbuf *m)
 {
-	assert(!dpg_tx_queue_full(q));
-	q->pkts[q->n_pkts++] = m;
+	assert(!dpg_ring_is_full(r));
+	r->r_data[r->r_head++] = m;
 }
 
 static int
-dpg_tx_queue_tx(struct dpg_tx_queue *q, int port_id, int queue_id)
+dpg_ring_tx(struct dpg_ring *r, int port_id, int queue_id)
 {
-	int txed;
+	int txed, n, m;
 
 	txed = 0;
-	if (q->n_pkts) {
-		txed = rte_eth_tx_burst(port_id, queue_id, q->pkts, q->n_pkts);
-		memmove(q->pkts, q->pkts + txed, (q->n_pkts - txed) * sizeof (struct rte_mbuf *));
-		q->n_pkts -= txed;
+	while (r->r_head) {
+		n = DPG_MIN(DPG_MAX_PKT_BURST, r->r_head);
+		m = rte_eth_tx_burst(port_id, queue_id, (struct rte_mbuf **)r->r_data, r->r_head);
+		memmove(r->r_data, r->r_data + txed, (r->r_head - m) * sizeof(void *));
+		txed += m;
+		r->r_head -= m;
+		if (m < n) {
+			break;
+		}
 	}
 	return txed;
 }
@@ -1810,6 +1823,9 @@ dpg_create_task(struct dpg_port *port, uint16_t lcore_id, uint16_t queue_id)
 	task->t_port_id = port->pt_id;
 	task->t_core_id = lcore_id;
 	task->t_queue_id = queue_id;
+
+	dpg_ring_init(&task->t_reqq, 128);
+	dpg_ring_init(&task->t_rplq, 128);
 
 	dpg_dlist_init(&task->session_field_head);
 
@@ -3038,15 +3054,15 @@ dpg_do_ping(struct dpg_port *port, struct dpg_task *task)
 		if (rc == 0) {
 			dpg_set_eth_hdr_addresses(port, m);
 
-			if (!dpg_tx_queue_full(&task->t_rplq)) {
-				dpg_tx_queue_add(&task->t_rplq, m);
+			if (!dpg_ring_is_full(&task->t_rplq)) {
+				dpg_ring_push(&task->t_rplq, m);
 				continue;
 			}
 		}
 		rte_pktmbuf_free(m);
 	}
 
-	room = dpg_tx_queue_room(&task->t_reqq);
+	room = dpg_ring_room(&task->t_reqq);
 	arp_resolved = DPG_READ_ONCE(port->arp_resolved);
 	
 	if (room && (port->Rflag || !arp_resolved)) {
@@ -3055,7 +3071,7 @@ dpg_do_ping(struct dpg_port *port, struct dpg_task *task)
 			    lcore->tsc - task->arp_request_time > g_dpg_hz) {
 				task->arp_request_time = lcore->tsc;
 				m = dpg_create_arp_request(task);
-				dpg_tx_queue_add(&task->t_reqq, m);
+				dpg_ring_push(&task->t_reqq, m);
 			}
 		} else if (port->Rflag) {
 			if (task->rps == 0) {
@@ -3068,14 +3084,14 @@ dpg_do_ping(struct dpg_port *port, struct dpg_task *task)
 
 			for (i = 0; i < n_reqs; ++i) {
 				m = dpg_create_request(task);
-				dpg_tx_queue_add(&task->t_reqq, m);
+				dpg_ring_push(&task->t_reqq, m);
 			}
 		}
 	}
 
-	txed = dpg_tx_queue_tx(&task->t_rplq, task->t_port_id, task->t_queue_id);
-	if (dpg_tx_queue_empty(&task->t_rplq)) {
-		txed += dpg_tx_queue_tx(&task->t_reqq, task->t_port_id, task->t_queue_id);
+	txed = dpg_ring_tx(&task->t_rplq, task->t_port_id, task->t_queue_id);
+	if (dpg_ring_is_empty(&task->t_rplq)) {
+		txed += dpg_ring_tx(&task->t_reqq, task->t_port_id, task->t_queue_id);
 	}
 
 	if (port->software_counters) {
@@ -3102,9 +3118,9 @@ dpg_do_fwd(struct dpg_port *port, struct dpg_task *task)
 		}
 	}
 
-	room = dpg_tx_queue_room(&task->t_rplq);
+	room = dpg_ring_room(&task->t_rplq);
 	for (i = 0; i < DPG_MIN(n_rx, room); ++i) {
-		dpg_tx_queue_add(&task->t_rplq, rx_pkts[i]);
+		dpg_ring_push(&task->t_rplq, rx_pkts[i]);
 	}
 	for (; i < n_rx; ++i) {
 		dpg_dbg("DROP!!");
@@ -3116,7 +3132,7 @@ dpg_do_fwd(struct dpg_port *port, struct dpg_task *task)
 //		dpg_set_eth_hdr_addresses(port, rx_pkts[i]);
 //	}
 
-	dpg_tx_queue_tx(&task->t_rplq, port->pt_fwd_id, task->t_queue_id);
+	dpg_ring_tx(&task->t_rplq, port->pt_fwd_id, task->t_queue_id);
 }
 
 static int
