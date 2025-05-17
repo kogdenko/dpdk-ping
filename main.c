@@ -1659,12 +1659,6 @@ dpg_ring_is_empty(struct dpg_ring *r)
 	return dpg_ring_size(r) == 0;
 }
 
-static int
-dpg_ring_room(struct dpg_ring *r)
-{
-	return r->r_size - dpg_ring_size(r);
-}
-
 static void
 dpg_ring_push_head(struct dpg_ring *r, void *e)
 {

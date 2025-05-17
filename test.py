@@ -20,6 +20,9 @@ VERBOSE = None
 BUILDPATH = None
 CORES = None
 
+# mysql -D gbtcp -Bse "select * from test;"
+DATABASE = None
+
 def make_echo_packet(p):
     e = p
     e[Ether].src, e[Ether].dst = p[Ether].dst, p[Ether].src
@@ -34,6 +37,10 @@ def make_echo_packet(p):
 
 def bytes_to_str(b):
     return b.decode('utf-8').strip()
+
+class dummy_database:
+    def insert(*args, **kwargs):
+        pass
 
 class dpdk_ping_interface:
     def __init__(self, name, index):
@@ -376,6 +383,13 @@ class dpdk_pcapreply(dpdk_app):
         return rdpcap(self.wpath)
 
 class TestDpdkPing(unittest.TestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if DATABASE:
+            self.database = Database()
+        else:
+            self.database = dummy_database
+
     def create_instance(self, classname):
         index = len(self.instances)
         inst = classname(index)
@@ -435,6 +449,11 @@ class TestDpdkPing(unittest.TestCase):
         if len(CORES) < n:
             self.skipTest("not enough cores: %d cores are required, but %d are available" %
                 (n, len(CORES)))
+
+    def save_to_database(self, data):
+        test_name = inspect.stack()[1].function
+        build_type = os.path.basename(BUILDPATH)
+        self.database.insert(test_name, build_type, data);
 
     def test_000_pcap(self):
         self.assert_cores(2)
@@ -662,7 +681,8 @@ class TestDpdkPing(unittest.TestCase):
         replies = if1.output["replies"]
         self.assertTrue(requests > 100000)
         self.assertTrue(requests - replies < 100000)
-        #print("throughput_pps", __name__, if1.output["opps"])
+
+        self.save_to_database(if1.output)
 
     # dpdk-ping --> dpdk-testpmd --> dpdk-ping
     def test_003_memif(self):
@@ -688,6 +708,12 @@ class TestDpdkPing(unittest.TestCase):
         pong.add_interface(if0)
         self.echo_bandwidth(if0, if1, ping, pong)
 
+    def test_000_database(self):
+        output = {}
+        output["ipps"] = 100
+        output["opps"] = 200
+        self.save_to_database(output)
+
 if __name__ == '__main__':
     conf.verb = 0
 
@@ -705,6 +731,14 @@ if __name__ == '__main__':
         CORES = [0]
     else:
         CORES = [int(i) for i in CORES.split(",")]
+
+    DATABASE = os.environ.get("DATABASE")
+    if DATABASE == None:
+        DATABASE = False
+    else:
+        DATABASE = int(DATABASE) > 0
+    if DATABASE:
+        from database import Database
 
     testpath = BUILDPATH + "/test"
     try:
