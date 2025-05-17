@@ -583,13 +583,13 @@ class TestDpdkPing(unittest.TestCase):
         self.assertEqual(c[ICMP].seq, p[ICMP].seq)
         self.assertEqual(c[ICMP].type, ICMP(type="echo-reply").type)
 
-    def _test_fwd(self):
+    def test_fwd(self):
         ip0 = "1.1.1.100"
         ip1 = "1.1.1.101"
 
         inst = self.create_dpdk_ping()
-        if0 = self.create_tap_interface()
-        if1 = self.create_tap_interface()
+        if0 = self.create_pg_interface()
+        if1 = self.create_pg_interface()
         if0.forward = if1
 
         inst.add_interface(if0)
@@ -604,16 +604,14 @@ class TestDpdkPing(unittest.TestCase):
         )
 
         #input("Press any key to continue");
-        if0.send(p)
-        capture = if1.recv(1, "ip && udp", timeout=1)
+        capture = self.send_and_expect(if0, p, 1, if1)
         self.assertEqual(len(capture), 1)
         c = capture[0]
         self.assertEqual(c[IP].src, ip0)
         self.assertEqual(c[IP].dst, ip1)
 
         p = make_echo_packet(c)
-        if1.send(p)
-        capture = if0.recv(1, "src %s" % ip1, 1)
+        capture = self.send_and_expect(if1, p, 1, if0)
         self.assertEqual(len(capture), 1)
         c = capture[0]
         self.assertEqual(c[IP].src, ip1)
@@ -651,11 +649,11 @@ class TestDpdkPing(unittest.TestCase):
         ping.add_interface(if1)
         pong.add_interface(if0)
 
-#        self.echo_bandwidth(if0, if1, ping, pong, 5, 1)
-#        requests = if1.output["requests"]
-#        replies = if1.output["replies"]
-#        self.assertGreaterEqual(requests, 4)
-#        self.assertGreaterEqual(replies, 4)
+        self.echo_bandwidth(if0, if1, ping, pong, 5, 1)
+        requests = if1.output["requests"]
+        replies = if1.output["replies"]
+        self.assertGreaterEqual(requests, 4)
+        self.assertGreaterEqual(replies, 4)
 
         # Benchmark
         self.echo_bandwidth(if0, if1, ping, pong)
@@ -664,7 +662,7 @@ class TestDpdkPing(unittest.TestCase):
         replies = if1.output["replies"]
         self.assertTrue(requests > 100000)
         self.assertTrue(requests - replies < 100000)
-        print("throughput_pps", __name__, if1.output["opps"])
+        #print("throughput_pps", __name__, if1.output["opps"])
 
     # dpdk-ping --> dpdk-testpmd --> dpdk-ping
     def test_003_memif(self):
