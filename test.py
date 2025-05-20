@@ -455,6 +455,36 @@ class TestDpdkPing(unittest.TestCase):
         build_type = os.path.basename(BUILDPATH)
         self.database.insert(test_name, build_type, data);
 
+    def validate_packet(self, packet):
+        # Copy packet to remove checksums for futher checksum recalculation
+        tmp = packet.__class__(bytes(packet))
+
+        # Find checksum positions in packet
+        counter = 0;
+        checksums = []
+        while True:
+            layer = tmp.getlayer(counter)
+            if layer == None:
+                break
+
+            layer = layer.copy()
+            layer.remove_payload()
+
+            if hasattr(layer, "chksum"):
+                checksums.append((counter, "chksum"))
+                delattr(tmp[counter], "chksum")
+            counter += 1
+
+        # Recalculate checksums
+        tmp = tmp.__class__(bytes(tmp))
+
+        for counter, attr in checksums:
+            layer = packet[counter]
+            cksum = getattr(layer, attr)
+            calc_cksum = getattr(tmp[counter], attr)
+            self.assertEqual(cksum, calc_cksum, "%s %s 0x%hx (incorrect(->0x%hx))" %
+                (layer.name, attr, cksum, calc_cksum))
+
     def test_000_pcap(self):
         self.assert_cores(2)
 
@@ -522,6 +552,8 @@ class TestDpdkPing(unittest.TestCase):
         capture = if0.recv(1, "icmp")
         self.assertEqual(len(capture), 1)
         c = capture[0]
+
+        self.validate_packet(c);
 
         self.assertEqual(c[IP].src, if0.sip)
         self.assertEqual(c[IP].dst, if0.dip)
