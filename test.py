@@ -367,12 +367,13 @@ class dpdk_pcapreply(dpdk_app):
             s += " -r %s" % self.rpath
         return s
 
-    def send_and_expect(self, packets, n_packets, timeout=1000):
+    def send_and_recv(self, packets, n_packets, timeout=1000):
         frame = inspect.stack()[1]
         path = "%s/%s_%d" % (self.testcase.testpath, frame.function, frame.lineno)
 
-        self.rpath = path + "_out.pcap"
-        wrpcap(self.rpath, packets)
+        if packets != None:
+            self.rpath = path + "_out.pcap"
+            wrpcap(self.rpath, packets)
 
         self.timeout = timeout
         self.n_packets = n_packets
@@ -436,14 +437,14 @@ class TestDpdkPing(unittest.TestCase):
             inst.interfaces = []
         conf.ifaces.reload()
 
-    def send_and_expect(self, iif, in_packets, n_out_packets, oif, timeout=1000):
+    def send_and_recv(self, iif, in_packets, n_out_packets, oif, timeout=1000):
         pcapreply = self.create_dpdk_pcapreply()
         self.assertTrue(type(iif) is dpdk_ping_pg_interface)
         self.assertTrue(type(oif) is dpdk_ping_pg_interface)
         pcapreply.add_interface(iif.memif[1])
         if oif != iif:
             pcapreply.add_interface(oif.memif[1])
-        return pcapreply.send_and_expect(in_packets, n_out_packets)
+        return pcapreply.send_and_recv(in_packets, n_out_packets)
 
     def assert_cores(self, n):
         if len(CORES) < n:
@@ -510,7 +511,7 @@ class TestDpdkPing(unittest.TestCase):
             / ICMP(id=1, type="echo-request")
         )
 
-        capture = pcapreply.send_and_expect(p, 1)
+        capture = pcapreply.send_and_recv(p, 1)
         self.assertEqual(len(capture), 1)
         c = capture[0]
         self.assertEqual(c[Ether].src, p[Ether].src)
@@ -610,6 +611,22 @@ class TestDpdkPing(unittest.TestCase):
             self.assertEqual(c[IP].src, intf.sip)
             self.assertEqual(c[IP].dst, intf.dip)
 
+    def test_001_icmp_request(self):
+        inst = self.create_dpdk_ping()
+        iif = self.create_pg_interface()
+        iif.sip = "1.1.1.100"
+        iif.dip = "2.2.2.100"     
+        inst.add_interface(iif)
+        inst.run()
+
+        capture = self.send_and_recv(iif, None, 1, iif)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.validate_packet(c)
+        self.assertEqual(c[IP].src, iif.sip)
+        self.assertEqual(c[IP].dst, iif.dip)
+        self.assertEqual(c[ICMP].type, ICMP(type="echo-request").type)
+
     def test_001_icmp_echo(self):
         inst = self.create_dpdk_ping()
         iif = self.create_pg_interface()
@@ -625,9 +642,10 @@ class TestDpdkPing(unittest.TestCase):
             / ICMP(id=333, seq=444, type="echo-request")
         )
 
-        capture = self.send_and_expect(iif, p, 1, iif)
+        capture = self.send_and_recv(iif, p, 1, iif)
         self.assertEqual(len(capture), 1)
         c = capture[0]
+        self.validate_packet(c)
         self.assertEqual(c[IP].src, iif.sip)
         self.assertEqual(c[IP].dst, iif.dip)
         self.assertEqual(c[ICMP].id, p[ICMP].id)
@@ -655,14 +673,14 @@ class TestDpdkPing(unittest.TestCase):
         )
 
         #input("Press any key to continue");
-        capture = self.send_and_expect(if0, p, 1, if1)
+        capture = self.send_and_recv(if0, p, 1, if1)
         self.assertEqual(len(capture), 1)
         c = capture[0]
         self.assertEqual(c[IP].src, ip0)
         self.assertEqual(c[IP].dst, ip1)
 
         p = make_echo_packet(c)
-        capture = self.send_and_expect(if1, p, 1, if0)
+        capture = self.send_and_recv(if1, p, 1, if0)
         self.assertEqual(len(capture), 1)
         c = capture[0]
         self.assertEqual(c[IP].src, ip1)
