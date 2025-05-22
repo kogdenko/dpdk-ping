@@ -70,10 +70,10 @@ typedef struct rte_ether_addr dpg_eth_addr_t;
 	rte_exit(EXIT_FAILURE, ##__VA_ARGS__);
 
 #define dpg_dbg(f, ...) do { \
-	printf("%s:%u: ", __FILE__, __LINE__); \
-	printf(f, ##__VA_ARGS__); \
-	printf("\n"); \
-	fflush(stdout); \
+	fprintf(stderr, "%s:%u: ", __FILE__, __LINE__); \
+	fprintf(stderr, f, ##__VA_ARGS__); \
+	fprintf(stderr, "\n"); \
+	fflush(stderr); \
 } while (0)
 
 const char *dpg_get_port_name(uint16_t port_id);

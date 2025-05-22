@@ -2710,7 +2710,7 @@ dpg_ip_input(struct dpg_task *task, struct rte_mbuf *m,
 	dpg_log_packet(task, DPG_RX, eh, ih6, ih, hl);
 
 	if (ih6 != NULL) {
-		if (port->srv6) {
+		if (port->srv6 && port->Eflag) {
 			return -ENOTSUP;
 		}
 
@@ -2841,19 +2841,64 @@ dpg_create_neighbour_advertisment(struct dpg_port *port, struct rte_mbuf *m,
 }
 
 static int
+dpg_icmpv6_input(struct dpg_task *task,	struct rte_mbuf *m,
+    struct dpg_eth_hdr *eh, struct dpg_ipv6_hdr *ih6, uint8_t *ptr, int len)
+{
+	int rc;
+	char desc[128];
+	char tgtbuf[INET6_ADDRSTRLEN];
+	dpg_uint128_t target;
+	struct dpg_icmpv6_hdr *ich6;
+	struct dpg_icmpv6_neigh_solicitaion *ns;
+	struct dpg_port *port;
+
+	port = dpg_port_get(task->t_port_id);
+
+	if (len < sizeof(*ich6)) {
+		return -EINVAL;
+	}
+
+	ich6 = (struct dpg_icmpv6_hdr *)ptr;
+	if (ich6->type != DPG_ICMPV6_NEIGH_SOLICITAION || len < sizeof(*ns)) {
+		return -EINVAL;
+	}
+	ns = (struct dpg_icmpv6_neigh_solicitaion *)ptr;
+	ptr += sizeof(*ns);
+	len -= sizeof(*ns);
+
+	if (g_dpg_verbose[DPG_RX] > 0) {
+		inet_ntop(AF_INET6, ns->target, tgtbuf, sizeof(tgtbuf));
+		snprintf(desc, sizeof(desc),
+		    "Neighbour Solicitation (target=%s)", tgtbuf);
+		dpg_log_ipv6(task, DPG_RX, eh, ih6, desc);
+	}
+
+	if (port->Rflag || port->Eflag) {
+		target = dpg_ipv6_to_uint128(ns->target);
+		rc = dpg_container_find(&port->addresses6, target);
+		if (!rc) {
+			return -EINVAL;
+		}
+
+		dpg_create_neighbour_advertisment(port, m, ih6, ns);
+
+		dpg_log_ipv6(task, DPG_TX, eh, ih6,
+		    "Neighbour Advertisment");
+	}
+
+	return 0;
+}
+
+static int
 dpg_ipv6_input(struct dpg_task *task, struct rte_mbuf *m)
 {
 	int rc, hl, proto;
+	char desc[128];
 	uint8_t *ptr;
 	uint16_t len;
-	char tgtbuf[INET6_ADDRSTRLEN];
-	char desc[128];
-	dpg_uint128_t target;
 	struct dpg_eth_hdr *eh;
 	struct dpg_ipv6_hdr *ih6;
-	struct dpg_icmpv6_hdr *ich6;
 	struct dpg_srv6_hdr *srh;
-	struct dpg_icmpv6_neigh_solicitaion *ns;
 	struct dpg_port *port;
 
 	port = dpg_port_get(task->t_port_id);
@@ -2889,38 +2934,12 @@ dpg_ipv6_input(struct dpg_task *task, struct rte_mbuf *m)
 			break;
 
 		case DPG_IPPROTO_ICMPV6:
-			if (len < sizeof(*ich6)) {
+			rc = dpg_icmpv6_input(task, m, eh, ih6, ptr, len);
+			if (rc == 0) {
+				return 0;
+			} else {
 				goto out;
 			}
-			ich6 = (struct dpg_icmpv6_hdr *)ptr;
-			if (ich6->type != DPG_ICMPV6_NEIGH_SOLICITAION || len < sizeof(*ns)) {
-				goto out;
-			}
-			ns = (struct dpg_icmpv6_neigh_solicitaion *)ptr;
-			ptr += sizeof(*ns);
-			len -= sizeof(*ns);
-
-			if (g_dpg_verbose[DPG_RX] > 0) {
-				inet_ntop(AF_INET6, ns->target, tgtbuf, sizeof(tgtbuf));
-				snprintf(desc, sizeof(desc),
-				         "Neighbour Solicitation (target=%s)",
-				         tgtbuf);
-				dpg_log_ipv6(task, DPG_RX, eh, ih6, desc);
-			}
-
-			if (port->Rflag || port->Eflag) {
-				target = dpg_ipv6_to_uint128(ns->target);
-				rc = dpg_container_find(&port->addresses6, target);
-				if (!rc) {
-					return -EINVAL;
-				}
-
-				dpg_create_neighbour_advertisment(port, m, ih6, ns);
-
-				dpg_log_ipv6(task, DPG_TX, eh, ih6, "Neighbour Advertisment");
-			}
-
-			return 0;
 
 		default:
 			goto out;

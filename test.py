@@ -8,6 +8,7 @@ import select
 import socket
 import subprocess
 import sys
+import signal
 import threading
 import time
 from inspect import currentframe
@@ -26,14 +27,28 @@ DATABASE = None
 def make_echo_packet(p):
     e = p
     e[Ether].src, e[Ether].dst = p[Ether].dst, p[Ether].src
-    e[IP].src, e[IP].dst = p[IP].dst, p[IP].src
+
+    if e.haslayer(IP):
+        e[IP].src, e[IP].dst = p[IP].dst, p[IP].src
+    if e.haslayer(IPv6):
+        e[IPv6].src, e[IPv6].dst = p[IPv6].dst, p[IPv6].src
+
     if e.haslayer(ICMP):
         e[ICMP].type = "echo-reply"
     elif e.haslayer(UDP):
         e[UDP].sport, e[UDP].dport = p[UDP].dport, p[UDP].sport
     elif e.haslayer(TCP):
-        pass
+        e[TCP].sport, e[TCP].dport = p[TCP].dport, p[TCP].sport
+        e[TCP].flags = "SA"
     return e
+
+def iter_to_str(it):
+    if type(it) == list:
+        return ','.join(iter_to_str(x) for x in it)
+    elif type(it) == tuple:
+        return "%d-%d" % (int(it[0]), int(it[1]))
+    else:
+        return str(it)
 
 def bytes_to_str(b):
     return b.decode('utf-8').strip()
@@ -51,8 +66,15 @@ class dpdk_ping_interface:
         self.core = CORES[0]
         self.smac = "22:4d:d9:98:03:%02x" % (index + 1)
         self.dmac = None
+        self.tcp = False
+        self.udp = False
+        self.addresses6 = None
+        self.srv6_src = None
+        self.srv6_dst = None
         self.sip = "10.0.0.100"
         self.dip = "10.0.0.200"
+        self.sport = 100
+        self.dport = 200
         self.bandwidth = 1
         self.rps = queue.Queue()
         self.pdr = None
@@ -69,31 +91,6 @@ class dpdk_ping_interface:
     def ping_args(self):
         args = "-p %s -l %d" % (self.dpdk_name, self.core)
 
-        if self.forward != None:
-            args += " -f %s" % self.forward.dpdk_name
-        else:
-            if self.request:
-                args += " -R 1"
-                args += " -B %d" % self.bandwidth
-
-                if self.pdr != None:
-                    args += " --pdr"
-                if self.pdr_period != None:
-                    args += " --pdr-period %d" % self.pdr_period
-                if self.pdr_start != None:
-                    args += " --pdr-start %d" % self.pdr_start
-                if self.pdr_percent != None:
-                    args += " --pdr-percent %f" % self.pdr_percent
-                if self.pdr_step != None:
-                    args += " --pdr-step %d" % self.pdr_step
-            else:
-                args += " -E 1"
-
-        if self.sip != None:
-            args += " -s %s" % self.sip
-        if self.dip:
-            args += " -d %s" % self.dip
-
         if VERBOSE != None:
             args += " -V %d" % VERBOSE
 
@@ -104,6 +101,53 @@ class dpdk_ping_interface:
             args += " -g %s" % self.gateway
         else:
             args += " -H %s" % self.smac
+
+        if self.forward != None:
+            args += " -f %s" % self.forward.dpdk_name
+            return args
+
+        if self.request:
+            args += " -R 1"
+            args += " -B %d" % self.bandwidth
+
+            if self.tcp:
+                args += " --tcp"
+
+            if self.udp:
+                args += " --udp"
+
+            if self.pdr != None:
+                args += " --pdr"
+            if self.pdr_period != None:
+                args += " --pdr-period %d" % self.pdr_period
+            if self.pdr_start != None:
+                args += " --pdr-start %d" % self.pdr_start
+            if self.pdr_percent != None:
+                args += " --pdr-percent %f" % self.pdr_percent
+            if self.pdr_step != None:
+                args += " --pdr-step %d" % self.pdr_step
+        else:
+            args += " -E 1"
+
+        if self.addresses6 != None:
+            args += " -6 %s" % iter_to_str(self.addresses6)
+
+        if self.srv6_src != None:
+            args += " --srv6-src %s" % self.srv6_src
+
+        if self.srv6_dst != None:
+            args += " --srv6-dst %s" % self.srv6_dst
+
+        if self.sip != None:
+            args += " -s %s" % iter_to_str(self.sip)
+        if self.dip:
+            args += " -d %s" % iter_to_str(self.dip)
+
+        if self.sport != None:
+            args += " -S %s" % iter_to_str(self.sport)
+
+        if self.dport != None:
+            args += " -D %s" % iter_to_str(self.dport)
 
         return args
 
@@ -212,14 +256,12 @@ class dpdk_app():
 
     def monitor(self):
         while self.proc.poll() is None:
-            line = self.proc.stdout.readline().decode("utf-8").strip("\n")
+            out = self.proc.stdout.readline().decode("utf-8").strip("\n")
  
-            self.process_output(line)
-                                    
             if VERBOSE != None:
-                print(line)
+                print(out)
 
-#            s = "Process `%s` exited with code %d\n" % (self.comm, self.proc.returncode)
+            self.process_output(out)
 
         out, err = self.proc.communicate()
         self.returncode = self.proc.returncode
@@ -256,7 +298,7 @@ class dpdk_app():
             print(self.comm)
 
         self.proc = subprocess.Popen(self.comm.split(),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         self.thread = threading.Thread(target=self.monitor)
         self.thread.start()
@@ -275,6 +317,11 @@ class dpdk_app():
               return None
         return self.returncode
 
+    def sigint(self):
+        if self.proc != None:
+            self.proc.send_signal(signal.SIGINT)
+            self.wait(10)
+
     def kill(self):
         if self.proc != None:
             self.proc.kill()
@@ -287,7 +334,7 @@ class dpdk_ping(dpdk_app):
         super().__init__(index, exe)
         self.duration = None
         self.omit = None
-        self.o = []
+        self.oselectors = []
         self.state_stat = False
 
     def reset(self):
@@ -305,25 +352,25 @@ class dpdk_ping(dpdk_app):
             if m != None:
                 self.state_stat = 1
                 o = line.split(",")[1:]
-                if len(self.o):
-                    assert(self.o == o)
-                self.o = o
+                if len(self.oselectors):
+                    assert(self.oselectors == o)
+                self.oselectors = o
                 return
         elif self.state_stat:
-            if len(line) != 0 and len(self.o) != 0:
+            if len(line) != 0 and len(self.oselectors) != 0:
                 output = line.split(",")
-                assert(len(output) - 1 == len(self.o))
+                assert(len(output) - 1 == len(self.oselectors))
                 intf = self.get_interface(output[0])
                 if intf != None:
-                    intf.output = dict(zip(self.o, [int(i) for i in output[1:]]))
+                    intf.output = dict(zip(self.oselectors, [int(i) for i in output[1:]]))
 
     def args(self):
         s = " --human-readable 0"
         if self.omit != None:
             s += " --omit %d" % self.omit
 
-        if len(self.o):
-            s += " -o " + ','.join(self.o)
+        if len(self.oselectors):
+            s += " -o " + ','.join(self.oselectors)
 
         if self.duration != None:
             s += " -t %d" % self.duration
@@ -471,9 +518,10 @@ class TestDpdkPing(unittest.TestCase):
             layer = layer.copy()
             layer.remove_payload()
 
-            if hasattr(layer, "chksum"):
-                checksums.append((counter, "chksum"))
-                delattr(tmp[counter], "chksum")
+            for attr in ["chksum", "cksum"]:
+                if hasattr(layer, attr):
+                    checksums.append((counter, attr))
+                    delattr(tmp[counter], attr)
             counter += 1
 
         # Recalculate checksums
@@ -627,6 +675,12 @@ class TestDpdkPing(unittest.TestCase):
         self.assertEqual(c[IP].dst, iif.dip)
         self.assertEqual(c[ICMP].type, ICMP(type="echo-request").type)
 
+        c = make_echo_packet(c)
+        self.send_and_recv(iif, c, 0, iif)
+
+        inst.sigint()
+        self.assertGreater(iif.output["replies"], 0)
+
     def test_001_icmp_echo(self):
         inst = self.create_dpdk_ping()
         iif = self.create_pg_interface()
@@ -652,6 +706,202 @@ class TestDpdkPing(unittest.TestCase):
         self.assertEqual(c[ICMP].seq, p[ICMP].seq)
         self.assertEqual(c[ICMP].type, ICMP(type="echo-reply").type)
 
+    def test_001_udp_request(self):
+        inst = self.create_dpdk_ping()
+        iif = self.create_pg_interface()
+        iif.sip = "1.1.1.100"
+        iif.sport = 100
+        iif.dip = "2.2.2.100"
+        iif.dport = 200
+        iif.udp = True
+        inst.add_interface(iif)
+        inst.run()
+
+        capture = self.send_and_recv(iif, None, 1, iif)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.validate_packet(c)
+        self.assertEqual(c[IP].src, iif.sip)
+        self.assertEqual(c[IP].dst, iif.dip)
+        self.assertEqual(c[UDP].sport, iif.sport)
+        self.assertEqual(c[UDP].dport, iif.dport)
+
+        c = make_echo_packet(c)
+        self.send_and_recv(iif, c, 0, iif)
+
+        inst.sigint()
+        self.assertGreater(iif.output["replies"], 0)
+
+    def test_001_udp_echo(self):
+        inst = self.create_dpdk_ping()
+        iif = self.create_pg_interface()
+        iif.request = False
+        iif.sip = "1.1.1.100"
+        iif.dip = "2.2.2.100"
+        sport = 100
+        dport = 200
+        inst.add_interface(iif)
+        inst.run()
+
+        p = (
+            Ether(src=iif.smac, dst=iif.smac)
+            / IP(src=iif.dip, dst=iif.sip)
+            / UDP(sport=sport, dport=dport)
+        )
+
+        capture = self.send_and_recv(iif, p, 1, iif)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.validate_packet(c)
+        self.assertEqual(c[IP].src, iif.sip)
+        self.assertEqual(c[IP].dst, iif.dip)
+        self.assertEqual(c[UDP].sport, dport)
+        self.assertEqual(c[UDP].dport, sport)
+
+    def test_001_tcp_request(self):
+        inst = self.create_dpdk_ping()
+        iif = self.create_pg_interface()
+        iif.sip = "1.1.1.100"
+        iif.sport = 100
+        iif.dip = "2.2.2.100"
+        iif.dport = 200
+        iif.tcp = True
+        inst.add_interface(iif)
+        inst.run()
+
+        capture = self.send_and_recv(iif, None, 1, iif)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.validate_packet(c)
+        self.assertEqual(c[IP].src, iif.sip)
+        self.assertEqual(c[IP].dst, iif.dip)
+        self.assertEqual(c[TCP].sport, iif.sport)
+        self.assertEqual(c[TCP].dport, iif.dport)
+        self.assertEqual(c[TCP].flags, "S")
+
+        c = make_echo_packet(c)
+        self.send_and_recv(iif, c, 0, iif)
+
+        inst.sigint()
+        self.assertGreater(iif.output["replies"], 0)
+
+    def test_001_tcp_echo(self):
+        inst = self.create_dpdk_ping()
+        iif = self.create_pg_interface()
+        iif.request = False
+        iif.sip = "1.1.1.100"
+        iif.dip = "2.2.2.100"
+        sport = 100
+        dport = 200
+        inst.add_interface(iif)
+        inst.run()
+
+        p = (
+            Ether(src=iif.smac, dst=iif.smac)
+            / IP(src=iif.dip, dst=iif.sip)
+            / TCP(sport=dport, dport=sport, flags="S")
+        )
+
+        capture = self.send_and_recv(iif, p, 1, iif)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.validate_packet(c)
+        self.assertEqual(c[IP].src, iif.sip)
+        self.assertEqual(c[IP].dst, iif.dip)
+        self.assertEqual(c[TCP].sport, sport)
+        self.assertEqual(c[TCP].dport, dport)
+        self.assertEqual(c[TCP].flags, "SA")
+
+    def test_002_ipv6_tunnel_request(self):
+        inst = self.create_dpdk_ping()
+        iif = self.create_pg_interface()
+        iif.srv6_src = "2001::1"
+        iif.srv6_dst = "2001::2"
+        iif.sip = "1.1.1.100"
+        iif.sport = 100
+        iif.dip = "2.2.2.100"
+        iif.dport = 200
+        iif.tcp = True
+        inst.add_interface(iif)
+        inst.run()
+
+        capture = self.send_and_recv(iif, None, 1, iif)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.validate_packet(c)
+        self.assertEqual(c[IPv6].src, iif.srv6_src)
+        self.assertEqual(c[IPv6].dst, iif.srv6_dst)
+        self.assertEqual(c[IPv6ExtHdrSegmentRouting].segleft, 0)
+        self.assertEqual(len(c[IPv6ExtHdrSegmentRouting].addresses), 1)
+        self.assertEqual(c[IPv6ExtHdrSegmentRouting].addresses[0], iif.srv6_dst)
+        self.assertEqual(c[IPv6ExtHdrSegmentRouting].nh, 4)
+        self.assertEqual(c[IP].src, iif.sip)
+        self.assertEqual(c[IP].dst, iif.dip)
+        self.assertEqual(c[TCP].sport, iif.sport)
+        self.assertEqual(c[TCP].dport, iif.dport)
+        self.assertEqual(c[TCP].flags, "S")
+
+        c = make_echo_packet(c)
+        self.send_and_recv(iif, c, 0, iif)
+
+        inst.sigint()
+        self.assertGreater(iif.output["replies"], 0)
+
+    def test_002_ipv6_tunnel_echo(self):
+        inst = self.create_dpdk_ping()
+        iif = self.create_pg_interface()
+        iif.request = False
+        srv6_src = "2001::1"
+        srv6_dst = "2001::2"
+        iif.sip = "1.1.1.100"
+        iif.dip = "2.2.2.100"
+        sport = 100
+        dport = 200
+        inst.add_interface(iif)
+        inst.run()
+
+        p = (
+            Ether(src=iif.smac, dst=iif.smac)
+            / IPv6(src=srv6_src, dst=srv6_dst)
+            / IP(src=iif.dip, dst=iif.sip)
+            / TCP(sport=dport, dport=sport, flags="S")
+        )
+
+        capture = self.send_and_recv(iif, p, 1, iif)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.validate_packet(c)
+        self.assertEqual(c[IP].src, iif.sip)
+        self.assertEqual(c[IP].dst, iif.dip)
+        self.assertEqual(c[TCP].sport, sport)
+        self.assertEqual(c[TCP].dport, dport)
+        self.assertEqual(c[TCP].flags, "SA")
+
+    def test_icmpv6_nd(self):
+        inst = self.create_dpdk_ping()
+        iif = self.create_pg_interface()
+        iif.request = False
+        src = "2001::1"
+        dst = "2001::2"
+        iif.addresses6 = dst
+
+        inst.add_interface(iif)
+        inst.run()
+
+        p = (
+            Ether(src=iif.smac, dst=iif.smac)
+            / IPv6(src=src, dst=dst)
+            / ICMPv6ND_NS(tgt=dst)
+        )
+       
+        capture = self.send_and_recv(iif, p, 1, iif)
+        self.assertEqual(len(capture), 1)
+        c = capture[0]
+        self.validate_packet(c)
+        self.assertTrue(c.haslayer(ICMPv6ND_NA))
+        self.assertTrue(c.haslayer(ICMPv6NDOptDstLLAddr))
+        self.assertEqual(c[ICMPv6ND_NA].tgt, dst)
+ 
     def test_fwd(self):
         ip0 = "1.1.1.100"
         ip1 = "1.1.1.101"
@@ -698,14 +948,14 @@ class TestDpdkPing(unittest.TestCase):
         ping.duration = duration
         ping_if.bandwidth = bandwidth
         ping.omit = 2
-        ping.o = ["ipps", "opps", "requests", "replies"]
+        ping.oselectors = ["ipps", "opps", "requests", "replies"]
         ping.run()
 
         ping.wait()
         pong.kill()
 
     # dpdk-ping --> dpdk-ping
-    def test_002_memif(self):
+    def test_003_memif(self):
         self.assert_cores(2)
        
         ping = self.create_dpdk_ping()
